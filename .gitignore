@@ -1,0 +1,17 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# knitr / rmarkdown cache and output
+*_cache/
+*_files/
+*.html
+
+# data (keep structure, not files)
+data/
+results/
+
+# macOS
+.DS_Store

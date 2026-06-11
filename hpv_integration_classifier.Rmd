@@ -1,0 +1,853 @@
+---
+title: "HPV Integration Classification Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+params:
+  # ── Required inputs ────────────────────────────────────────────────────────
+  # ── Optional inputs (set to "" to skip) ────────────────────────────────────
+  # ── Thresholds ─────────────────────────────────────────────────────────────
+  # ── Output ─────────────────────────────────────────────────────────────────
+  searchhpv_txt:        "data/searchHPV_breakpoints.txt"
+  aa_profiles:          "data/amplicon_classification_profiles.tsv"
+  purity_tsv:           "data/tumor_purity.tsv"     # columns: sample_id, tumor_purity
+  coverage_tsv:         "data/viral_coverage.tsv"   # columns: sample_id, observed_viral_cov, expected_viral_cov
+  min_sr_junc:          3      # minimum srNum to retain a breakpoint
+  high_conf_only:       FALSE  # TRUE: restrict to High Confidence Site rows only
+  vaf_purity_ratio_lo:  0.5    # VAF/purity below this → subclonal
+  excess_coverage_fold: 1.5    # obs/expected viral cov above this → episomal modifier
+  site_bin_bp:          200    # window (bp) for collapsing nearby breakpoints into one site
+  internal_hpv_junc_min: 2     # min intra-HPV split reads to flag episomal rearrangement
+  out_dir:              "results"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggplot2)
+  library(knitr)
+  library(kableExtra)
+})
+
+dir.create(params$out_dir,                        showWarnings = FALSE)
+dir.create(file.path(params$out_dir, "plots"),    showWarnings = FALSE)
+
+# ── Classification labels (8 categories) ──────────────────────────────────
+# Drawn directly from the canonical classification table:
+#   1. Episomal (non-integrated)
+#   2. Episomal rearranged
+#   3. Integrated clonal, single site
+#   4. Integrated clonal, concatemeric single locus
+#   5. Integrated clonal, multiple sites
+#   6. Integrated subclonal
+#   7. Integrated + episomal (mixed)
+#   8. Human-HPV chimeric episome
+
+class_palette <- c(
+  "Episomal (non-integrated)"                = "#1D9E75",
+  "Episomal rearranged"                      = "#3EC9A7",
+  "Integrated clonal, single site"           = "#534AB7",
+  "Integrated clonal, concatemeric"          = "#7F77DD",
+  "Integrated clonal, multiple sites"        = "#3A2F8F",
+  "Integrated subclonal"                     = "#D85A30",
+  "Integrated + episomal (mixed)"            = "#BA7517",
+  "Human-HPV chimeric episome"               = "#D4537E",
+  "Unclassified"                             = "#888780"
+)
+
+# ── Assay flags: categories that CANNOT be definitively called from
+#    short-read WGS alone (require long-read / optical mapping) ─────────────
+long_read_required <- c(
+  "Integrated clonal, concatemeric",
+  "Integrated + episomal (mixed)",
+  "Human-HPV chimeric episome"
+)
+```
+
+------------------------------------------------------------------------
+
+# Input parameters
+
+All thresholds and file paths used for this run. Edit via `params:` in
+the YAML header, or pass at render time:
+
+``` r
+rmarkdown::render("hpv_integration_classifier.Rmd",
+                  params = list(searchhpv_txt = "my_file.txt", ...))
+```
+
+```{r show-params, echo=FALSE}
+tibble(
+  Parameter = names(unlist(params)),
+  Value     = as.character(unlist(params))
+) %>%
+  kable(align = "ll") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover"),
+                full_width = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Classification scheme
+
+The pipeline resolves each sample into one of **8 canonical
+categories**, following the evidence hierarchy below. Categories marked
+⚠️ cannot be definitively called from short-read WGS alone and require
+long-read or optical mapping for confirmation.
+
+| \# | Category | Key discriminator | Long-read required? |
+|----|----|----|----|
+| 1 | Episomal (non-integrated) | No human-viral junctions; uniform viral coverage; circular HPV-HPV reconstruction | No |
+| 2 | Episomal rearranged | No human-viral junctions; intra-HPV junctions at non-canonical coordinates | No |
+| 3 | Integrated clonal, single site | Single reciprocal junction pair; VAF ≈ purity; linear AA amplicon | No |
+| 4 | Integrated clonal, concatemeric | Single locus; internal HPV-HPV head-to-tail junctions; no circularization | ⚠️ Yes |
+| 5 | Integrated clonal, multiple sites | ≥2 reciprocal junction pairs at distinct loci; all at clonal VAF | No |
+| 6 | Integrated subclonal | Junction VAF(s) below purity-adjusted expectation | No |
+| 7 | Integrated + episomal (mixed) | Human-viral junctions present AND excess viral coverage (episomal pool) | ⚠️ Yes |
+| 8 | Human-HPV chimeric episome | Human-viral junctions with non-contiguous/trans-chromosomal human flanks; circular AA reconstruction with human content | ⚠️ Yes |
+
+------------------------------------------------------------------------
+
+# 1 Load & parse data {.tabset}
+
+## searchHPV breakpoints
+
+```{r load-searchhpv}
+shpv_raw <- read_tsv(params$searchhpv_txt, show_col_types = FALSE)
+
+# ── Column mapping ─────────────────────────────────────────────────────────
+# contigName                → contig_name
+# orientation               → orientation   (hv / vh)
+# genomeInsertionChromosome → chr_human
+# genomeInsertionPoint      → pos_human
+# hpvInsertionPoint         → pos_hpv
+# SiteConfidence            → site_conf
+# ContigConfidence          → contig_conf
+# srNum                     → sr_num
+# Sample                    → sample_full   (e.g. HPV02-RS-Pool_1_23__HPV16)
+# ID1                       → junction_id
+# Breakpoint_duplicate      → bp_duplicate
+
+shpv <- shpv_raw %>%
+  rename(
+    contig_name  = contigName,
+    chr_human    = genomeInsertionChromosome,
+    pos_human    = genomeInsertionPoint,
+    pos_hpv      = hpvInsertionPoint,
+    site_conf    = SiteConfidence,
+    contig_conf  = ContigConfidence,
+    sr_num       = srNum,
+    sample_full  = Sample,
+    junction_id  = ID1,
+    bp_duplicate = Breakpoint_duplicate
+  ) %>%
+  mutate(
+    sample_id = str_remove(sample_full, "__HPV\\d+.*$"),
+    hpv_type  = str_extract(sample_full, "HPV\\d+$")
+  ) %>%
+  filter(!is.na(sr_num), sr_num >= params$min_sr_junc)
+
+if (params$high_conf_only) {
+  shpv <- filter(shpv, site_conf == "High Confidence Site")
+}
+
+cat(sprintf("Loaded %d breakpoints across %d samples (srNum >= %d).\n",
+            nrow(shpv), n_distinct(shpv$sample_id), params$min_sr_junc))
+```
+
+```{r preview-shpv, echo=FALSE}
+head(shpv, 10) %>%
+  select(sample_id, hpv_type, chr_human, pos_human, pos_hpv,
+         orientation, sr_num, site_conf, contig_conf) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover", "responsive"),
+                full_width = TRUE) %>%
+  scroll_box(height = "300px")
+```
+
+## AmpliconArchitect profiles
+
+```{r load-aa}
+# Required columns: sample_id, amplicon_id, amplicon_classification
+# AA values used by this pipeline:
+#   "Cyclic"               → circular reconstruction (episomal or chimeric ecDNA)
+#   "Linear"               → chromosomal integration (no circularization)
+#   "BFB"                  → breakage-fusion-bridge (treated as chromosomal)
+#   "Heavily-rearranged"   → chromosomal
+#   "No-amplification"     → no focal amplicon
+#
+# For chimeric ecDNA detection, the pipeline also looks for human sequence
+# content within cyclic amplicons (aa_has_human_content column, if present).
+
+aa <- read_tsv(params$aa_profiles, show_col_types = FALSE)
+
+# Flag whether any cyclic amplicon per sample contains human sequence
+# If your AA output has a column indicating human content (e.g. "human_content"
+# or "contains_human"), rename it to aa_human_in_cyclic below.
+# Otherwise this defaults to NA and chimeric ecDNA detection relies on
+# junction coordinate dispersion alone.
+if (!"aa_human_in_cyclic" %in% names(aa)) {
+  aa <- aa %>%
+    group_by(sample_id) %>%
+    mutate(aa_human_in_cyclic = NA) %>%
+    ungroup()
+}
+
+cat(sprintf("Loaded %d amplicon entries across %d samples.\n",
+            nrow(aa), n_distinct(aa$sample_id)))
+```
+
+```{r preview-aa, echo=FALSE}
+head(aa, 10) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover"),
+                full_width = FALSE)
+```
+
+## Tumor purity (optional)
+
+```{r load-purity}
+purity <- NULL
+if (!is.null(params$purity_tsv) && nchar(params$purity_tsv) > 0 &&
+    file.exists(params$purity_tsv)) {
+  purity <- read_tsv(params$purity_tsv, show_col_types = FALSE)
+  cat(sprintf("Loaded purity for %d samples.\n", nrow(purity)))
+} else {
+  cat("No purity file provided — VAF concordance (subclonal flag) will be 'unknown'.\n")
+}
+```
+
+## Viral coverage (optional)
+
+```{r load-coverage}
+coverage <- NULL
+if (!is.null(params$coverage_tsv) && nchar(params$coverage_tsv) > 0 &&
+    file.exists(params$coverage_tsv)) {
+  coverage <- read_tsv(params$coverage_tsv, show_col_types = FALSE)
+  # Expected columns: sample_id, observed_viral_cov, expected_viral_cov
+  # observed_viral_cov: mean depth across the viral genome
+  # expected_viral_cov: depth predicted from junction VAF alone
+  #   (i.e. junction_VAF * mean_host_depth)
+  # Excess = episomal pool contribution
+  cat(sprintf("Loaded coverage data for %d samples.\n", nrow(coverage)))
+} else {
+  cat("No coverage file provided — episomal modifier (Q5) will be 'unknown'.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+# 2 Per-sample breakpoint summaries
+
+Breakpoints within **`r params$site_bin_bp` bp** on the same chromosome
+are collapsed into one integration site. A reciprocal pair requires at
+least one `hv` and one `vh` orientation breakpoint per site.
+
+```{r junc-summary}
+junc_summary <- shpv %>%
+  mutate(
+    site_bin = paste(chr_human,
+                     floor(pos_human / params$site_bin_bp) * params$site_bin_bp,
+                     sep = ":")
+  ) %>%
+  group_by(sample_id) %>%
+  summarise(
+    n_breakpoints      = n(),
+    n_sites            = n_distinct(site_bin),
+    n_hv               = sum(orientation == "hv"),
+    n_vh               = sum(orientation == "vh"),
+    has_reciprocal     = n_hv > 0 & n_vh > 0,
+    hpv_type           = first(hpv_type),
+    high_conf_n        = sum(site_conf == "High Confidence Site"),
+    max_sr             = max(sr_num, na.rm = TRUE),
+    mean_sr            = round(mean(sr_num, na.rm = TRUE), 1),
+    # Spread of human chromosomal coordinates — large spread or multi-chr
+    # suggests chimeric ecDNA (non-contiguous human flanks)
+    n_distinct_chr     = n_distinct(chr_human),
+    chr_coord_range_mb = if (n_distinct(chr_human) == 1)
+                           round((max(pos_human) - min(pos_human)) / 1e6, 2)
+                         else NA_real_,
+    .groups = "drop"
+  )
+
+junc_summary %>%
+  kable(col.names = c("Sample", "Breakpoints", "Sites", "hv", "vh",
+                      "Reciprocal?", "HPV type", "High-conf n",
+                      "Max srNum", "Mean srNum",
+                      "Distinct chr", "Coord range (Mb)")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover", "responsive"),
+                full_width = TRUE) %>%
+  scroll_box(height = "350px")
+```
+
+------------------------------------------------------------------------
+
+# 3 Decision-tree functions
+
+```{r decision-tree-functions}
+
+# ── Q1a: Human-viral junctions present? ───────────────────────────────────
+q1_junctions <- function(sid) {
+  s <- filter(junc_summary, sample_id == sid)
+  if (nrow(s) == 0) return(list(result = FALSE, n_bp = 0L, n_sites = 0L))
+  list(result = TRUE, n_bp = s$n_breakpoints, n_sites = s$n_sites)
+}
+
+# ── Q1b: Intra-HPV (viral-viral) junctions at non-canonical coordinates?
+#  Flags episomal rearrangement when no human-viral junctions exist.
+#  Requires a column "intra_hpv_sr" in shpv (split reads where both
+#  coordinates map within the HPV genome at non-adjacent positions).
+#  If absent, this check is skipped and the sample stays "Episomal (non-integrated)".
+q1b_intra_hpv <- function(sid) {
+  if (!"intra_hpv_sr" %in% names(shpv)) return(list(result = FALSE, n = 0L))
+  n <- shpv %>%
+    filter(sample_id == sid, !is.na(intra_hpv_sr)) %>%
+    pull(intra_hpv_sr) %>%
+    sum(na.rm = TRUE)
+  list(result = n >= params$internal_hpv_junc_min, n = as.integer(n))
+}
+
+# ── Q2: VAF concordant with tumor purity? ─────────────────────────────────
+# VAF proxy = max(srNum) / 100  (replace with a true VAF column if available)
+q2_concordance <- function(sid) {
+  if (is.null(purity)) return(list(result = "unknown", ratio = NA_real_))
+  pu <- filter(purity, sample_id == sid)
+  if (nrow(pu) == 0 || is.na(pu$tumor_purity[1])) {
+    return(list(result = "unknown", ratio = NA_real_))
+  }
+  js        <- filter(junc_summary, sample_id == sid)
+  vaf_proxy <- js$max_sr[1] / 100
+  ratio     <- vaf_proxy / pu$tumor_purity[1]
+  list(
+    result = if (ratio < params$vaf_purity_ratio_lo) "subclonal" else "concordant",
+    ratio  = round(ratio, 3)
+  )
+}
+
+# ── Q3: AA context — circular (ecDNA) or linear (chromosomal)? ────────────
+q3_context <- function(sid) {
+  sa <- filter(aa, sample_id == sid)
+  if (nrow(sa) == 0) return(list(
+    result         = "chromosomal",
+    aa_class       = "not_in_AA",
+    has_cyclic     = FALSE,
+    has_human_cont = FALSE
+  ))
+  classes       <- sa$amplicon_classification
+  has_cyclic    <- any(str_detect(classes, regex("cyclic", ignore_case = TRUE)))
+  has_human_cont <- any(sa$aa_human_in_cyclic %in% TRUE, na.rm = TRUE)
+  list(
+    result         = if (has_cyclic) "cyclic" else "chromosomal",
+    aa_class       = paste(sort(unique(classes)), collapse = ";"),
+    has_cyclic     = has_cyclic,
+    has_human_cont = has_human_cont
+  )
+}
+
+# ── Q4: Internal HPV-HPV head-to-tail junctions? (concatemeric) ───────────
+# Requires column "internal_hpv_hpv_junctions" (logical or count) in AA output
+# or a dedicated column in shpv. Falls back to FALSE if absent.
+q4_concatemeric <- function(sid) {
+  if ("internal_hpv_hpv_junctions" %in% names(aa)) {
+    sa  <- filter(aa, sample_id == sid)
+    val <- any(sa$internal_hpv_hpv_junctions %in% TRUE, na.rm = TRUE)
+    return(list(result = val))
+  }
+  list(result = FALSE)
+}
+
+# ── Q5: Single junction pair or multiple? ─────────────────────────────────
+q5_multiplicity <- function(sid) {
+  n <- filter(junc_summary, sample_id == sid)$n_sites[1]
+  list(result = if (is.na(n) || n <= 1) "single" else "multiple", n_sites = n)
+}
+
+# ── Q6: Excess viral coverage (episomal modifier)? ────────────────────────
+q6_excess_cov <- function(sid) {
+  if (is.null(coverage)) return(list(result = "unknown", cov_ratio = NA_real_))
+  sc <- filter(coverage, sample_id == sid)
+  if (nrow(sc) == 0) return(list(result = "unknown", cov_ratio = NA_real_))
+  ratio <- sc$observed_viral_cov[1] / sc$expected_viral_cov[1]
+  list(
+    result    = if (!is.na(ratio) && ratio > params$excess_coverage_fold) "yes" else "no",
+    cov_ratio = round(ratio, 3)
+  )
+}
+
+# ── Q7: Chimeric ecDNA? (non-contiguous / trans-chromosomal human flanks) ─
+# Triggered when AA cyclic amplicon contains human content OR when junction
+# human coordinates span multiple chromosomes / are very far apart.
+q7_chimeric_ecdna <- function(sid, q3) {
+  js <- filter(junc_summary, sample_id == sid)
+  # Strong evidence: AA reports human content in cyclic amplicon
+  if (isTRUE(q3$has_human_cont)) return(TRUE)
+  # Supportive evidence: junctions span multiple chromosomes
+  if (!is.na(js$n_distinct_chr) && js$n_distinct_chr > 1) return(TRUE)
+  # Supportive evidence: single chromosome but flanks > 10 Mb apart
+  # (inconsistent with a simple chromosomal insertion)
+  if (!is.na(js$chr_coord_range_mb) && js$chr_coord_range_mb > 10) return(TRUE)
+  FALSE
+}
+```
+
+------------------------------------------------------------------------
+
+# 4 Classify all samples
+
+```{r classify}
+classify_sample <- function(sid) {
+
+  hpv_t <- filter(junc_summary, sample_id == sid)$hpv_type[1]
+  if (is.na(hpv_t)) hpv_t <- shpv %>% filter(sample_id == sid) %>% pull(hpv_type) %>% first()
+
+  q1  <- q1_junctions(sid)
+  q1b <- q1b_intra_hpv(sid)
+
+  # ── No human-viral junctions ──────────────────────────────────────────────
+  if (!q1$result) {
+    cat_label <- if (q1b$result) "Episomal rearranged" else "Episomal (non-integrated)"
+    return(tibble(
+      sample_id            = sid,
+      classification       = cat_label,
+      canonical_name       = cat_label,
+      assay_note           = "Standard WGS sufficient",
+      long_read_required   = FALSE,
+      q1_has_junctions     = FALSE,
+      q1_n_breakpoints     = 0L,
+      q1_n_sites           = 0L,
+      q1b_intra_hpv_sr     = as.integer(q1b$n),
+      q2_concordance       = NA_character_,
+      q2_vaf_ratio         = NA_real_,
+      q3_aa_class          = NA_character_,
+      q3_aa_cyclic         = NA,
+      q3_aa_human_content  = NA,
+      q4_concatemeric      = NA,
+      q5_multiplicity      = NA_character_,
+      q5_n_sites           = NA_integer_,
+      q6_excess_cov        = NA_character_,
+      q6_cov_ratio         = NA_real_,
+      hpv_type             = hpv_t
+    ))
+  }
+
+  # ── Human-viral junctions present — check VAF ─────────────────────────────
+  q2 <- q2_concordance(sid)
+  if (q2$result == "subclonal") {
+    return(tibble(
+      sample_id            = sid,
+      classification       = "Integrated subclonal",
+      canonical_name       = "Subclonal integration (any form)",
+      assay_note           = "Deep coverage required (>200x for CCF ~0.3)",
+      long_read_required   = FALSE,
+      q1_has_junctions     = TRUE,
+      q1_n_breakpoints     = as.integer(q1$n_bp),
+      q1_n_sites           = as.integer(q1$n_sites),
+      q1b_intra_hpv_sr     = as.integer(q1b$n),
+      q2_concordance       = "subclonal",
+      q2_vaf_ratio         = q2$ratio,
+      q3_aa_class          = NA_character_,
+      q3_aa_cyclic         = NA,
+      q3_aa_human_content  = NA,
+      q4_concatemeric      = NA,
+      q5_multiplicity      = NA_character_,
+      q5_n_sites           = NA_integer_,
+      q6_excess_cov        = NA_character_,
+      q6_cov_ratio         = NA_real_,
+      hpv_type             = hpv_t
+    ))
+  }
+
+  # ── Clonal junctions — check AA context ───────────────────────────────────
+  q3 <- q3_context(sid)
+
+  if (q3$result == "cyclic") {
+    # Cyclic AA: chimeric ecDNA or pure episomal — distinguish by human content
+    is_chimeric <- q7_chimeric_ecdna(sid, q3)
+    if (is_chimeric) {
+      return(tibble(
+        sample_id            = sid,
+        classification       = "Human-HPV chimeric episome",
+        canonical_name       = "Heterocatemer / virus-host ecDNA",
+        assay_note           = "DEFINITIVE CALL REQUIRES long-read + optical mapping",
+        long_read_required   = TRUE,
+        q1_has_junctions     = TRUE,
+        q1_n_breakpoints     = as.integer(q1$n_bp),
+        q1_n_sites           = as.integer(q1$n_sites),
+        q1b_intra_hpv_sr     = as.integer(q1b$n),
+        q2_concordance       = q2$result,
+        q2_vaf_ratio         = q2$ratio,
+        q3_aa_class          = q3$aa_class,
+        q3_aa_cyclic         = TRUE,
+        q3_aa_human_content  = q3$has_human_cont,
+        q4_concatemeric      = NA,
+        q5_multiplicity      = NA_character_,
+        q5_n_sites           = NA_integer_,
+        q6_excess_cov        = NA_character_,
+        q6_cov_ratio         = NA_real_,
+        hpv_type             = hpv_t
+      ))
+    }
+  }
+
+  # ── Chromosomal context: check for concatemeric integration ───────────────
+  q4 <- q4_concatemeric(sid)
+
+  if (q4$result) {
+    return(tibble(
+      sample_id            = sid,
+      classification       = "Integrated clonal, concatemeric",
+      canonical_name       = "Type 2 integration (McBride & Warburton 2017)",
+      assay_note           = "DEFINITIVE CALL REQUIRES long-read or optical mapping",
+      long_read_required   = TRUE,
+      q1_has_junctions     = TRUE,
+      q1_n_breakpoints     = as.integer(q1$n_bp),
+      q1_n_sites           = as.integer(q1$n_sites),
+      q1b_intra_hpv_sr     = as.integer(q1b$n),
+      q2_concordance       = q2$result,
+      q2_vaf_ratio         = q2$ratio,
+      q3_aa_class          = q3$aa_class,
+      q3_aa_cyclic         = q3$has_cyclic,
+      q3_aa_human_content  = q3$has_human_cont,
+      q4_concatemeric      = TRUE,
+      q5_multiplicity      = NA_character_,
+      q5_n_sites           = NA_integer_,
+      q6_excess_cov        = NA_character_,
+      q6_cov_ratio         = NA_real_,
+      hpv_type             = hpv_t
+    ))
+  }
+
+  # ── Single vs multi-site ───────────────────────────────────────────────────
+  q5  <- q5_multiplicity(sid)
+  q6  <- q6_excess_cov(sid)
+
+  has_episomal_modifier <- !is.na(q6$result) && q6$result == "yes"
+
+  if (has_episomal_modifier) {
+    return(tibble(
+      sample_id            = sid,
+      classification       = "Integrated + episomal (mixed)",
+      canonical_name       = "Mixed integrated/episomal",
+      assay_note           = "Distinction from chimeric ecDNA requires long-read or optical mapping",
+      long_read_required   = TRUE,
+      q1_has_junctions     = TRUE,
+      q1_n_breakpoints     = as.integer(q1$n_bp),
+      q1_n_sites           = as.integer(q1$n_sites),
+      q1b_intra_hpv_sr     = as.integer(q1b$n),
+      q2_concordance       = q2$result,
+      q2_vaf_ratio         = q2$ratio,
+      q3_aa_class          = q3$aa_class,
+      q3_aa_cyclic         = q3$has_cyclic,
+      q3_aa_human_content  = q3$has_human_cont,
+      q4_concatemeric      = FALSE,
+      q5_multiplicity      = q5$result,
+      q5_n_sites           = as.integer(q5$n_sites),
+      q6_excess_cov        = "yes",
+      q6_cov_ratio         = q6$cov_ratio,
+      hpv_type             = hpv_t
+    ))
+  }
+
+  # ── Simple chromosomal integration: single vs multi-site ──────────────────
+  final_class <- if (q5$result == "single") {
+    "Integrated clonal, single site"
+  } else {
+    "Integrated clonal, multiple sites"
+  }
+  canonical <- if (q5$result == "single") {
+    "Type 1 integration (McBride & Warburton 2017)"
+  } else {
+    "Multi-locus Type 1 integration"
+  }
+
+  tibble(
+    sample_id            = sid,
+    classification       = final_class,
+    canonical_name       = canonical,
+    assay_note           = "Standard WGS sufficient; long-read aids breakpoint resolution",
+    long_read_required   = FALSE,
+    q1_has_junctions     = TRUE,
+    q1_n_breakpoints     = as.integer(q1$n_bp),
+    q1_n_sites           = as.integer(q1$n_sites),
+    q1b_intra_hpv_sr     = as.integer(q1b$n),
+    q2_concordance       = q2$result,
+    q2_vaf_ratio         = q2$ratio,
+    q3_aa_class          = q3$aa_class,
+    q3_aa_cyclic         = q3$has_cyclic,
+    q3_aa_human_content  = q3$has_human_cont,
+    q4_concatemeric      = FALSE,
+    q5_multiplicity      = q5$result,
+    q5_n_sites           = as.integer(q5$n_sites),
+    q6_excess_cov        = q6$result,
+    q6_cov_ratio         = q6$cov_ratio,
+    hpv_type             = hpv_t
+  )
+}
+
+all_samples <- union(unique(shpv$sample_id), unique(aa$sample_id))
+results     <- map_dfr(all_samples, classify_sample)
+
+write_tsv(results, file.path(params$out_dir, "summary_table.tsv"))
+cat(sprintf("Classified %d samples. Written to %s/summary_table.tsv\n",
+            nrow(results), params$out_dir))
+```
+
+------------------------------------------------------------------------
+
+# 5 Results {.tabset}
+
+## Classification summary
+
+```{r results-summary}
+results %>%
+  count(classification, canonical_name, assay_note, long_read_required,
+        name = "Samples") %>%
+  arrange(desc(Samples)) %>%
+  mutate(long_read_required = if_else(long_read_required, "⚠️ Yes", "No")) %>%
+  kable(col.names = c("Classification", "Canonical name", "Assay note",
+                      "Long-read required?", "Samples"),
+        align = "llllr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  column_spec(4, bold = TRUE,
+              color = if_else(
+                results %>%
+                  count(classification, long_read_required) %>%
+                  arrange(desc(n)) %>%
+                  pull(long_read_required),
+                "darkorange", "black"))
+```
+
+## Long-read flagged samples
+
+Samples in categories that **cannot be definitively resolved by
+short-read WGS**:
+
+```{r results-longread}
+lr_df <- filter(results, long_read_required)
+if (nrow(lr_df) > 0) {
+  lr_df %>%
+    select(sample_id, hpv_type, classification, assay_note,
+           q1_n_breakpoints, q3_aa_class) %>%
+    kable(col.names = c("Sample", "HPV type", "Classification",
+                        "Assay note", "Breakpoints", "AA class")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE) %>%
+    row_spec(0, background = "#fff3cd")
+} else {
+  cat("No samples flagged as requiring long-read confirmation.")
+}
+```
+
+## searchHPV breakpoints
+
+```{r results-junctions}
+results %>%
+  filter(q1_has_junctions) %>%
+  select(sample_id, hpv_type, q1_n_breakpoints, q1_n_sites,
+         q1b_intra_hpv_sr, classification) %>%
+  arrange(desc(q1_n_breakpoints)) %>%
+  kable(col.names = c("Sample", "HPV type", "Breakpoints", "Sites",
+                      "Intra-HPV sr", "Classification")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = TRUE) %>%
+  scroll_box(height = "400px")
+```
+
+## VAF / purity concordance
+
+```{r results-vaf}
+vdf <- filter(results, !is.na(q2_vaf_ratio))
+if (nrow(vdf) > 0) {
+  vdf %>%
+    select(sample_id, q2_concordance, q2_vaf_ratio, classification) %>%
+    kable(col.names = c("Sample", "Concordance", "VAF/purity ratio", "Classification"),
+          digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE)
+} else {
+  cat("No purity data provided — Q2 skipped.")
+}
+```
+
+## AmpliconArchitect context
+
+```{r results-aa}
+results %>%
+  filter(!is.na(q3_aa_class)) %>%
+  count(q3_aa_class, q3_aa_cyclic, q3_aa_human_content, classification) %>%
+  mutate(across(c(q3_aa_cyclic, q3_aa_human_content), as.character)) %>%
+  kable(col.names = c("AA class(es)", "Cyclic?", "Human content in cyclic?",
+                      "Classification", "N"),
+        align = "llllr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+## Multiplicity & coverage
+
+```{r results-multiplicity}
+results %>%
+  filter(!is.na(q5_multiplicity)) %>%
+  select(sample_id, hpv_type, q5_multiplicity, q5_n_sites,
+         q6_excess_cov, q6_cov_ratio, classification) %>%
+  kable(col.names = c("Sample", "HPV type", "Multiplicity", "N sites",
+                      "Excess cov?", "Cov ratio", "Classification"),
+        digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = TRUE) %>%
+  scroll_box(height = "400px")
+```
+
+## Full results table
+
+```{r results-full}
+results %>%
+  kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = TRUE) %>%
+  scroll_box(height = "500px")
+```
+
+------------------------------------------------------------------------
+
+# 6 Plots {.tabset}
+
+## Classification frequency
+
+```{r plot-bar, fig.height=5}
+p_bar <- results %>%
+  count(classification, long_read_required) %>%
+  mutate(
+    classification = fct_reorder(classification, n),
+    lr_label       = if_else(long_read_required, "⚠ Long-read required", "Short-read sufficient")
+  ) %>%
+  ggplot(aes(x = n, y = classification, fill = classification)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = n), hjust = -0.3, size = 3.5) +
+  geom_text(aes(x = 0.1, label = if_else(long_read_required, "⚠", "")),
+            hjust = 0, size = 4, colour = "darkorange") +
+  scale_fill_manual(values = class_palette) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "HPV integration classification (8-category scheme)",
+       subtitle = "⚠ = long-read / optical mapping required for definitive call",
+       x = "Samples", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+
+ggsave(file.path(params$out_dir, "plots", "01_classification_bar.pdf"),
+       p_bar, width = 9, height = 6)
+p_bar
+```
+
+## Breakpoint counts
+
+```{r plot-junc}
+p_junc <- results %>%
+  filter(!is.na(q1_n_breakpoints), q1_n_breakpoints > 0) %>%
+  ggplot(aes(x = q1_n_breakpoints, fill = classification)) +
+  geom_histogram(bins = 20, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = class_palette, name = NULL) +
+  labs(title = "Breakpoints per sample (searchHPV)",
+       x = paste0("Breakpoints (srNum >= ", params$min_sr_junc, ")"),
+       y = "Samples") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", legend.text = element_text(size = 8))
+
+ggsave(file.path(params$out_dir, "plots", "02_junction_counts.pdf"),
+       p_junc, width = 8, height = 5)
+p_junc
+```
+
+## Site multiplicity by HPV type
+
+```{r plot-multi}
+p_multi <- results %>%
+  filter(!is.na(q5_multiplicity)) %>%
+  count(q5_multiplicity, hpv_type, classification) %>%
+  ggplot(aes(x = hpv_type, y = n, fill = classification)) +
+  geom_col(position = "stack", width = 0.6) +
+  facet_wrap(~q5_multiplicity, labeller = label_both) +
+  scale_fill_manual(values = class_palette, name = NULL) +
+  labs(title = "Site multiplicity by HPV type",
+       x = "HPV type", y = "Samples") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position  = "bottom",
+        legend.text      = element_text(size = 8),
+        axis.text.x      = element_text(angle = 30, hjust = 1))
+
+ggsave(file.path(params$out_dir, "plots", "03_site_multiplicity.pdf"),
+       p_multi, width = 8, height = 5)
+p_multi
+```
+
+## Confidence breakdown
+
+```{r plot-conf, fig.height=4}
+p_conf <- shpv %>%
+  count(site_conf, contig_conf) %>%
+  ggplot(aes(x = site_conf, y = n, fill = contig_conf)) +
+  geom_col(position = "dodge", width = 0.6) +
+  scale_fill_brewer(palette = "Set2", name = "Contig confidence") +
+  labs(title = "searchHPV site & contig confidence breakdown",
+       x = "Site confidence", y = "Breakpoints") +
+  theme_minimal(base_size = 13)
+
+ggsave(file.path(params$out_dir, "plots", "04_confidence_breakdown.pdf"),
+       p_conf, width = 7, height = 5)
+p_conf
+```
+
+## Long-read flag summary
+
+```{r plot-longread, fig.height=4}
+p_lr <- results %>%
+  count(classification, long_read_required) %>%
+  mutate(
+    classification = fct_reorder(classification, n),
+    assay          = if_else(long_read_required,
+                             "Long-read / optical mapping required",
+                             "Short-read WGS sufficient")
+  ) %>%
+  ggplot(aes(x = n, y = classification, fill = assay)) +
+  geom_col(width = 0.65) +
+  scale_fill_manual(values = c("Long-read / optical mapping required" = "#D85A30",
+                               "Short-read WGS sufficient"           = "#534AB7"),
+                    name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Assay requirement by classification",
+       x = "Samples", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank(),
+        legend.position    = "bottom")
+
+ggsave(file.path(params$out_dir, "plots", "05_assay_requirement.pdf"),
+       p_lr, width = 9, height = 5)
+p_lr
+```
+
+------------------------------------------------------------------------
+
+# 7 Session info
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
