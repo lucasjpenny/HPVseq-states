@@ -1,0 +1,618 @@
+---
+title: "HPV State Classification — OPC real data (HN-keyed)"
+subtitle: "searcHPV V2 + per-base coverage z-scores, AmpliconArchitect optional"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  # ── Inputs ────────────────────────────────────────────────────────────────
+  summary_xlsx:  "data/summ_OPC.v7.2.xlsx"                 # crosswalk: seqname <-> HN id
+  searchhpv_txt: "data/2024-05-27_SearcHPV_OPC_V2.txt"     # OPC integration (V2 schema)
+  zscore_csv:    "data/20241205_Zscores_stats_nofilter.csv" # OPC per-base coverage z-scores
+  aa_tsv:        "data/merged_result_tables.tsv"            # AA (NOT OPC yet) - only used if use_aa
+  # ── The toggle you asked for ──────────────────────────────────────────────
+  use_aa:             false   # FALSE = run on searcHPV + coverage only (current OPC state)
+  # ── Timepoint filter ──────────────────────────────────────────────────────
+  timepoint_filter:   "Baseline"   # keep only this timepoint; set "" or null for all
+  # ── Thresholds (tune here) ────────────────────────────────────────────────
+  high_conf_site_only: false  # TRUE = keep only "High Confidence Site" searcHPV breakpoints
+  site_bin_bp:        200     # window (bp) to collapse nearby breakpoints into one site
+  z_cut:              1.5     # |z| >= this = coverage dip (negative) or gain (positive)
+  uniform_frac:       0.05    # if < this fraction of bases deviate, coverage is "uniform"
+  excess_gain_frac:   0.50    # if >= this fraction of bases gained, treat as episomal pool
+  distant_flank_mb:   10      # human flanks farther apart than this (same chr) = chimeric signal
+  focal_cn:           10      # AA max copy number above this = focal amplification
+  overlap_window_bp:  200     # window (bp) to call a coverage/junction/AA overlap
+  cov_gap_tol:        25      # bp: merge elevated runs separated by gaps <= this
+  cov_min_seg_len:    30      # bp: discard sustained segments shorter than this (noise)
+  n_plot_samples:     6       # how many integrated samples to draw track PDFs for
+  out_dir:            "results"   # TSV tables
+  fig_dir:            "plots"     # per-sample plot PDFs go in this sub-directory
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6.5)
+```
+
+This version runs the **real OPC data** and uses the **HN identifier**
+(the summary's `id` = `Patient_ID`\_`Timepoint`, e.g. `HN2186_Baseline`)
+as the reference key throughout. The three sources are tied together by
+the summary crosswalk:
+
+-   **searcHPV** (`2024-05-27_SearcHPV_OPC_V2.txt`) — integration
+    junctions. Its `Sample` is a sequencing-library name; it also
+    carries `Patient_ID`, `Timepoint`, and a ready-made `id`.
+-   **Coverage** (`20241205_Zscores_stats_nofilter.csv`) — per-base
+    z-scores, keyed only by sequencing-library name (`file.name`).
+-   **Summary** (`summ_OPC.v7.2.xlsx`) — maps every sequencing-library
+    `Sample` to its HN `id`, `Patient_ID`, and `Timepoint`. This is the
+    crosswalk that lets coverage be relabelled to HN ids.
+
+> **HN id is per-timepoint.** Because integration and coverage differ
+> between a patient's timepoints, the working key is the full `id` (HN +
+> timepoint). The bare HN (`Patient_ID`) is also carried as a column so
+> you can group across timepoints.
+
+## The AA toggle
+
+`params$use_aa` switches AmpliconArchitect on or off. OPC has no AA yet,
+so the default is **`use_aa: false`** and the run uses searcHPV +
+coverage only. When you have OPC AA, point `params$aa_tsv` at it and set
+`use_aa: true` (you can also flip it in the RStudio *Knit with
+Parameters* dialog).
+
+**What AA off costs you.** AA is the only source for circular-molecule
+evidence, so with it off the classifier cannot positively call
+`Human-HPV chimeric episome` or the AA-driven
+`Integrated + episomal (mixed)`. Those samples instead resolve to the
+best junction/coverage call (usually multi-site integration), and the
+`notes` column records that AA was unavailable. Everything else
+(episomal vs rearranged, single vs multiple integration sites) is
+unaffected.
+
+------------------------------------------------------------------------
+
+# 1 Packages and labels
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(knitr)
+  library(kableExtra)
+})
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(params$fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+state_levels <- c(
+  "Episomal only",
+  "HPV episomal rearranged",
+  "Human-HPV chimeric episome",
+  "Integrated clonal, single site",
+  "Integrated clonal, multiple sites",
+  "Integrated + episomal (mixed)",
+  "Unclassified"
+)
+state_palette <- c(
+  "Episomal only"                     = "#1D9E75",
+  "HPV episomal rearranged"           = "#3EC9A7",
+  "Human-HPV chimeric episome"        = "#D4537E",
+  "Integrated clonal, single site"    = "#534AB7",
+  "Integrated clonal, multiple sites" = "#3A2F8F",
+  "Integrated + episomal (mixed)"     = "#BA7517",
+  "Unclassified"                      = "#888780"
+)
+
+cat(sprintf("AmpliconArchitect: %s\n", if (isTRUE(params$use_aa)) "ENABLED" else "DISABLED (searcHPV + coverage only)"))
+```
+
+------------------------------------------------------------------------
+
+# 2 Crosswalk (HN id is the reference)
+
+```{r crosswalk}
+# NOTE: the sheet has TWO columns named "Sample" (col 1 = full sequencing name
+# with _L00x, col 2 = without). readxl renames duplicates, so we grab the first
+# by position - that is the one matching coverage file.name and searcHPV Sample.
+summ_raw <- suppressMessages(read_excel(params$summary_xlsx, .name_repair = "unique"))
+seqname_col <- names(summ_raw)[1]
+
+summ <- summ_raw %>%
+  transmute(seqname   = as.character(.data[[seqname_col]]),
+            sample_id = as.character(id),          # HN_Timepoint = the reference key
+            patient   = as.character(Patient_ID),  # bare HN
+            timepoint = as.character(Timepoint),
+            hpv_type  = as.character(HPV_realign))
+
+# Timepoint filter (default Baseline). Cascades to coverage (via the crosswalk)
+# and to searcHPV (filtered in the load chunk).
+tp_filter <- params$timepoint_filter
+if (!is.null(tp_filter) && nzchar(tp_filter)) {
+  summ <- filter(summ, timepoint == tp_filter)
+  cat(sprintf("Timepoint filter: keeping only '%s'.\n", tp_filter))
+} else {
+  cat("Timepoint filter: none (all timepoints).\n")
+}
+
+# seqname -> HN id, and the reverse (id is unique per seqname)
+seq2id <- setNames(summ$sample_id, summ$seqname)
+id2seq <- setNames(summ$seqname,   summ$sample_id)
+
+meta <- summ %>% distinct(sample_id, patient, timepoint, hpv_type)
+
+cat(sprintf("Crosswalk: %d sequencing libraries -> %d HN ids.\n",
+            nrow(summ), n_distinct(summ$sample_id)))
+head(summ, 5) %>% kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# 3 Parsers
+
+Each parser returns a per-sample feature table keyed by the HN
+`sample_id`.
+
+## 3.1 searcHPV (V2 schema)
+
+The V2 file has no `orientation` or `srNum` columns, so reciprocal-pair
+and read-count filters from earlier versions are dropped. Breakpoints
+are filtered by `SiteConfidence` instead (optional, via
+`high_conf_site_only`), and the HN id is taken from the file's own `id`
+column when present, otherwise resolved through the crosswalk, otherwise
+derived from the sample name (so synthetic tests still work).
+
+```{r parse-searchpv}
+parse_searchpv <- function(df,
+                           high_conf_site_only = params$high_conf_site_only,
+                           bin_bp = params$site_bin_bp) {
+  empty <- tibble(sample_id = character(), hpv_type = character(),
+                  n_breakpoints = integer(), n_sites = integer(),
+                  n_distinct_chr = integer(), chr_coord_range_mb = double(),
+                  flanks_noncontiguous = logical(), has_hv_junctions = logical())
+  if (is.null(df) || nrow(df) == 0) return(empty)
+
+  sid <- if ("id" %in% names(df)) as.character(df$id) else
+           ifelse(as.character(df$Sample) %in% names(seq2id),
+                  unname(seq2id[as.character(df$Sample)]),
+                  str_remove(as.character(df$Sample), "__HPV\\d+.*$"))
+  hpv <- if ("HPV_realign" %in% names(df)) as.character(df$HPV_realign) else
+           str_extract(as.character(df$Sample), "HPV\\d+")
+  conf <- if ("SiteConfidence" %in% names(df)) as.character(df$SiteConfidence) else NA_character_
+
+  work <- tibble(
+    sample_id = sid,
+    hpv_type  = hpv,
+    chr       = as.character(df$genomeInsertionChromosome),
+    pos       = suppressWarnings(as.numeric(str_trim(as.character(df$genomeInsertionPoint)))),
+    site_conf = conf
+  )
+  if (isTRUE(high_conf_site_only) && any(!is.na(work$site_conf)))
+    work <- filter(work, str_detect(tolower(coalesce(site_conf, "")), "high"))
+  if (nrow(work) == 0) return(empty)
+
+  work %>%
+    mutate(site_bin = paste(chr, floor(pos / bin_bp) * bin_bp, sep = ":")) %>%
+    group_by(sample_id) %>%
+    summarise(
+      hpv_type           = first(na.omit(hpv_type)),
+      n_breakpoints      = n(),
+      n_sites            = n_distinct(site_bin),
+      n_distinct_chr     = n_distinct(chr),
+      chr_coord_range_mb = if (n_distinct(chr) == 1)
+                             (max(pos, na.rm = TRUE) - min(pos, na.rm = TRUE)) / 1e6
+                           else NA_real_,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      flanks_noncontiguous = (n_distinct_chr > 1) |
+                             (!is.na(chr_coord_range_mb) &
+                                chr_coord_range_mb > params$distant_flank_mb),
+      has_hv_junctions = n_breakpoints > 0
+    )
+}
+```
+
+## 3.2 Coverage z-scores
+
+```{r parse-cov}
+parse_cov <- function(df, z = params$z_cut,
+                      uniform_frac = params$uniform_frac,
+                      excess_frac  = params$excess_gain_frac) {
+  empty <- tibble(seqname = character(), cov_frac_gain = double(),
+                  cov_frac_dip = double(), cov_mean_z = double(),
+                  cov_uniform = logical(), cov_n_gain_seg = integer(),
+                  cov_n_dip_seg = integer(), cov_n_event_seg = integer(),
+                  cov_excess = logical())
+  if (is.null(df) || nrow(df) == 0) return(empty)
+
+  id_col <- names(df)[1]                       # "file.name"
+  ids    <- as.character(df[[id_col]])
+  mat    <- as.matrix(df[, setdiff(names(df), id_col)])
+  storage.mode(mat) <- "double"
+
+  frac_gain <- rowMeans(mat >= z,  na.rm = TRUE)
+  frac_dip  <- rowMeans(mat <= -z, na.rm = TRUE)
+  mean_z    <- rowMeans(mat,        na.rm = TRUE)
+
+  count_seg <- function(v, up) {
+    flag <- if (up) (!is.na(v) & v >= z) else (!is.na(v) & v <= -z)
+    if (!any(flag)) return(0L)
+    sum(rle(flag)$values)
+  }
+  n_gain_seg <- apply(mat, 1, count_seg, up = TRUE)
+  n_dip_seg  <- apply(mat, 1, count_seg, up = FALSE)
+
+  tibble(
+    seqname         = ids,
+    cov_frac_gain   = frac_gain,
+    cov_frac_dip    = frac_dip,
+    cov_mean_z      = mean_z,
+    cov_uniform     = (frac_gain + frac_dip) < uniform_frac,
+    cov_n_gain_seg  = as.integer(n_gain_seg),
+    cov_n_dip_seg   = as.integer(n_dip_seg),
+    cov_n_event_seg = as.integer(n_gain_seg + n_dip_seg),
+    cov_excess      = frac_gain >= excess_frac
+  )
+}
+```
+
+## 3.3 AmpliconArchitect (only read when `use_aa`)
+
+```{r parse-aa}
+parse_aa <- function(df, focal_cn = params$focal_cn) {
+  empty <- tibble(sample_id = character(), aa_has_hpv = logical(),
+                  aa_hpv_cyclic = logical(), aa_cyclic_has_human = logical(),
+                  aa_max_cn = double(), aa_focal_amp = logical())
+  if (is.null(df) || nrow(df) == 0) return(empty)
+
+  sid <- as.character(df$`Sample name`)
+  sid <- ifelse(sid %in% names(seq2id), unname(seq2id[sid]), sid)  # map to HN id if possible
+
+  df %>%
+    mutate(.sid = sid) %>%
+    transmute(
+      sample_id     = .sid,
+      has_hpv_loc   = str_detect(tolower(coalesce(Location, "")), "hpv"),
+      has_human_loc = str_detect(coalesce(Location, ""), "chr"),
+      is_cyclic     = str_detect(tolower(coalesce(Classification, "")), "cyclic"),
+      is_virus      = str_detect(tolower(coalesce(Classification, "")), "virus"),
+      max_cn        = suppressWarnings(as.numeric(`Feature maximum copy number`))
+    ) %>%
+    group_by(sample_id) %>%
+    summarise(
+      aa_has_hpv          = any(has_hpv_loc | is_virus),
+      aa_hpv_cyclic       = any(is_cyclic & has_hpv_loc),
+      aa_cyclic_has_human = any(is_cyclic & has_hpv_loc & has_human_loc),
+      aa_max_cn           = suppressWarnings(max(max_cn, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(aa_max_cn = ifelse(is.finite(aa_max_cn), aa_max_cn, NA_real_),
+           aa_focal_amp = !is.na(aa_max_cn) & aa_max_cn >= focal_cn)
+}
+```
+
+------------------------------------------------------------------------
+
+# 4 Load real data
+
+```{r load}
+# searcHPV (apply the same timepoint filter when the column is present)
+shpv_raw <- read_tsv(params$searchhpv_txt, show_col_types = FALSE)
+if (!is.null(tp_filter) && nzchar(tp_filter) && "Timepoint" %in% names(shpv_raw))
+  shpv_raw <- filter(shpv_raw, as.character(Timepoint) == tp_filter)
+shpv_features <- parse_searchpv(shpv_raw)
+
+# coverage (large file; read once, keep raw for plotting)
+cov_raw       <- read_csv(params$zscore_csv, show_col_types = FALSE)
+cov_features  <- parse_cov(cov_raw) %>%
+  mutate(sample_id = unname(seq2id[seqname])) %>%   # seqname -> HN id
+  filter(!is.na(sample_id)) %>%
+  select(sample_id, everything(), -seqname)
+
+# AA only if toggled on
+aa_raw <- if (isTRUE(params$use_aa) && file.exists(params$aa_tsv))
+  read_tsv(params$aa_tsv, show_col_types = FALSE) else NULL
+aa_features <- if (isTRUE(params$use_aa)) parse_aa(aa_raw) else parse_aa(NULL)
+
+cat(sprintf("searcHPV: %d integrated samples\ncoverage: %d samples (HN-mapped)\nAA: %s\n",
+            nrow(shpv_features), nrow(cov_features),
+            if (isTRUE(params$use_aa)) sprintf("%d samples", nrow(aa_features)) else "disabled"))
+```
+
+```{r unify}
+build_unified <- function(shpv, aa, cov, meta) {
+  ids <- unique(c(shpv$sample_id, aa$sample_id, cov$sample_id))
+  tibble(sample_id = ids) %>%
+    left_join(shpv, by = "sample_id") %>%
+    left_join(aa,   by = "sample_id") %>%
+    left_join(cov,  by = "sample_id") %>%
+    left_join(meta, by = "sample_id", suffix = c("", "_meta")) %>%
+    mutate(
+      hpv_type         = coalesce(hpv_type, hpv_type_meta),
+      has_hv_junctions = coalesce(has_hv_junctions, FALSE),
+      n_breakpoints    = coalesce(n_breakpoints, 0L),
+      n_sites          = coalesce(n_sites, 0L)
+    ) %>%
+    select(-any_of("hpv_type_meta"))
+}
+
+unified <- build_unified(shpv_features, aa_features, cov_features, meta)
+cat(sprintf("Unified OPC table: %d samples.\n", nrow(unified)))
+```
+
+------------------------------------------------------------------------
+
+# 5 Classifier
+
+Site count (single vs multiple) is decided by the searcHPV junction
+count. Coverage that exceeds the junction count (extra gains or losses)
+is recorded in `notes`, not used to change the site count. AA-dependent
+states are only reachable when `use_aa` is on.
+
+```{r classify-fn}
+classify_state <- function(r) {
+  hv              <- isTRUE(r$has_hv_junctions)
+  cyclic_hpv      <- isTRUE(r$aa_hpv_cyclic)
+  cyclic_human    <- isTRUE(r$aa_cyclic_has_human)
+  noncontig_flank <- isTRUE(r$flanks_noncontiguous)
+  uniform         <- isTRUE(r$cov_uniform)
+  excess          <- isTRUE(r$cov_excess)
+  n_sites         <- ifelse(is.na(r$n_sites), 0L, r$n_sites)
+  has_cov         <- !is.na(r$cov_frac_gain)
+
+  if (!hv) {
+    if (!isTRUE(r$aa_has_hpv) && !has_cov) return("Unclassified")
+    if (has_cov && !uniform) return("HPV episomal rearranged")
+    return("Episomal only")
+  }
+  if (cyclic_human || (noncontig_flank && cyclic_hpv))
+    return("Human-HPV chimeric episome")
+  if (cyclic_hpv || excess) return("Integrated + episomal (mixed)")
+  if (n_sites >= 2) return("Integrated clonal, multiple sites")
+  if (n_sites == 1) return("Integrated clonal, single site")
+  "Unclassified"
+}
+
+add_notes <- function(df, aa_enabled = isTRUE(params$use_aa)) {
+  df %>%
+    mutate(
+      cov_extra = coalesce(has_hv_junctions, FALSE) &
+                  coalesce(cov_n_event_seg, 0L) > coalesce(n_sites, 0L),
+      no_aa = aa_enabled & is.na(aa_has_hpv),
+      notes = pmap_chr(
+        list(cov_extra, no_aa, cov_n_event_seg, n_sites),
+        function(extra, na_aa, nev, ns) {
+          msgs <- character()
+          if (isTRUE(extra))
+            msgs <- c(msgs, sprintf(
+              "coverage shows %d event segment(s) vs %d junction site(s); extra is coverage-only and NOT counted as a site",
+              ifelse(is.na(nev), 0L, nev), ifelse(is.na(ns), 0L, ns)))
+          if (isTRUE(na_aa))
+            msgs <- c(msgs, "no AmpliconArchitect evidence for this sample")
+          if (length(msgs) == 0) "" else paste(msgs, collapse = "; ")
+        })
+    )
+}
+
+classify_table <- function(unified, aa_enabled = isTRUE(params$use_aa)) {
+  if (nrow(unified) == 0)
+    return(mutate(unified, state = factor(character(), levels = state_levels)))
+  states <- pmap_chr(unified, function(...) classify_state(tibble(...)))
+  unified %>%
+    mutate(state = factor(states, levels = state_levels)) %>%
+    add_notes(aa_enabled = aa_enabled)
+}
+```
+
+------------------------------------------------------------------------
+
+# 6 Classify the OPC cohort
+
+```{r classify-run}
+results <- classify_table(unified)
+
+state_summary <- results %>% count(state, name = "n", .drop = FALSE) %>% arrange(desc(n))
+state_summary %>%
+  kable(caption = sprintf("OPC HPV state distribution (use_aa = %s)", params$use_aa)) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+results %>%
+  filter(state != "Unclassified") %>%
+  count(state, name = "n", .drop = FALSE) %>%
+  ggplot(aes(n, fct_rev(state), fill = state)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = n), hjust = -0.3, size = 4) +
+  scale_fill_manual(values = state_palette) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "OPC samples per HPV state", x = "Samples", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+```{r classify-table-out}
+out_tbl <- results %>%
+  transmute(
+    sample_id, patient, timepoint, state, hpv_type,
+    junctions = has_hv_junctions, n_sites,
+    cov_frac_gain, cov_frac_dip, cov_uniform, cov_excess, cov_n_event_seg,
+    aa_hpv_cyclic, aa_cyclic_has_human, notes
+  ) %>%
+  arrange(patient, timepoint)
+
+write_tsv(out_tbl, file.path(params$out_dir, "hpv_state_OPC.tsv"))
+
+out_tbl %>% head(25) %>%
+  kable(caption = "OPC classification (first 25 rows; full table written to results/hpv_state_OPC.tsv)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
+```
+
+Per-patient view across timepoints (HN as the grouping key):
+
+```{r per-patient}
+results %>%
+  filter(!is.na(patient)) %>%
+  count(patient, state, .drop = FALSE) %>%
+  filter(n > 0) %>%
+  pivot_wider(names_from = state, values_from = n, values_fill = 0) %>%
+  head(20) %>%
+  kable(caption = "States per patient across timepoints (first 20 patients)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = TRUE)
+```
+
+------------------------------------------------------------------------
+
+# 7 Combined per-sample feature plots
+
+One figure per sample, stacking coverage z-score, searcHPV junctions,
+and (when `use_aa`) AA viral intervals on the shared HPV-genome axis.
+Each is written as a PDF named `HPVtracks_<HN id>.pdf` to
+`params$fig_dir` (default the run directory).
+
+```{r plot-helpers}
+seg_from_flag <- function(flag, gap_tol) {
+  idx <- which(flag)
+  if (length(idx) == 0) return(list())
+  brk <- c(0L, which(diff(idx) > (gap_tol + 1L)), length(idx))
+  lapply(seq_len(length(brk) - 1L), function(j) {
+    grp <- idx[(brk[j] + 1L):brk[j + 1L]]; c(min(grp), max(grp))
+  })
+}
+cov_segments <- function(zvec, cut = params$z_cut,
+                         gap_tol = params$cov_gap_tol, min_len = params$cov_min_seg_len) {
+  out <- list()
+  for (dir in c(1L, -1L)) {
+    flag <- if (dir == 1L) (!is.na(zvec) & zvec >= cut) else (!is.na(zvec) & zvec <= -cut)
+    for (m in seg_from_flag(flag, gap_tol)) {
+      s <- m[1]; e <- m[2]
+      if (e - s + 1L < min_len) next
+      mz <- mean(zvec[s:e], na.rm = TRUE)
+      if ((dir == 1L && mz >= cut) || (dir == -1L && mz <= -cut))
+        out[[length(out) + 1L]] <- tibble(seg_start = s, seg_end = e,
+                                          type = if (dir == 1L) "gain" else "dip")
+    }
+  }
+  if (length(out) == 0) return(tibble(seg_start = integer(), seg_end = integer(), type = character()))
+  bind_rows(out) %>% arrange(seg_start)
+}
+
+# Coverage vector for one HN id (NA-trimmed at the tail).
+cov_vec <- function(sid) {
+  sq <- unname(id2seq[sid])          # single-bracket: returns NA if id absent
+  if (length(sq) == 0 || is.na(sq)) return(numeric())
+  row <- cov_raw[as.character(cov_raw[[1]]) == sq, , drop = FALSE]
+  if (nrow(row) == 0) return(numeric())
+  v <- as.numeric(row[1, -1])
+  last <- suppressWarnings(max(which(!is.na(v))))
+  if (is.finite(last)) v[seq_len(last)] else v
+}
+
+# searcHPV viral breakpoint positions for one HN id.
+shpv_real <- shpv_raw %>%
+  mutate(sample_id = if ("id" %in% names(.)) as.character(id) else
+                       ifelse(as.character(Sample) %in% names(seq2id),
+                              unname(seq2id[as.character(Sample)]),
+                              str_remove(as.character(Sample), "__HPV\\d+.*$")),
+         hpv_pos   = suppressWarnings(as.numeric(str_trim(as.character(hpvInsertionPoint)))))
+junc_pos <- function(sid) shpv_real %>% filter(sample_id == sid, !is.na(hpv_pos)) %>% pull(hpv_pos)
+
+# AA viral intervals for one HN id (empty when AA off).
+aa_intervals <- function(sid) {
+  if (!isTRUE(params$use_aa) || is.null(aa_raw)) return(tibble(start = double(), end = double()))
+  sn <- names(seq2id)[match(sid, seq2id)]
+  rows <- aa_raw %>% filter(as.character(`Sample name`) %in% c(sid, sn))
+  if (nrow(rows) == 0) return(tibble(start = double(), end = double()))
+  locs <- unlist(str_extract_all(rows$Location, "hpv[^']*?:\\d+-\\d+"))
+  if (length(locs) == 0) return(tibble(start = double(), end = double()))
+  m <- str_match(locs, ":(\\d+)-(\\d+)")
+  tibble(start = as.numeric(m[, 2]), end = as.numeric(m[, 3]))
+}
+```
+
+```{r plot-fn}
+plot_sample_tracks <- function(sid, state_label = "", show_aa = isTRUE(params$use_aa),
+                               z_cut = params$z_cut) {
+  zvec <- cov_vec(sid)
+  jpos <- junc_pos(sid)
+  ai   <- aa_intervals(sid)
+
+  trk <- c("Coverage (z-score)", "searcHPV junctions")
+  if (show_aa) trk <- c(trk, "AA viral intervals")
+  as_trk <- function(x) factor(x, levels = trk)
+
+  cov_df <- if (length(zvec))
+    tibble(pos = seq_along(zvec), z = zvec, track = as_trk(trk[1])) else NULL
+  segs   <- if (length(zvec)) cov_segments(zvec, cut = z_cut) else tibble()
+  seg_df <- if (nrow(segs)) mutate(segs, track = as_trk(trk[1])) else NULL
+  thr_df <- tibble(track = as_trk(trk[1]), yint = c(z_cut, -z_cut))
+  junc_df <- if (length(jpos)) tibble(pos = jpos, y = 1, track = as_trk(trk[2])) else NULL
+  aa_df   <- if (show_aa && nrow(ai)) mutate(ai, y = 1, track = as_trk("AA viral intervals")) else NULL
+
+  ggplot() +
+    { if (!is.null(seg_df))
+        geom_rect(data = seg_df, aes(xmin = seg_start, xmax = seg_end,
+                  ymin = -Inf, ymax = Inf, fill = type), alpha = 0.18, inherit.aes = FALSE) } +
+    { if (length(jpos))
+        geom_vline(xintercept = jpos, linetype = "dashed", colour = "#534AB7", linewidth = 0.4) } +
+    geom_hline(data = thr_df, aes(yintercept = yint), linetype = "dotted", colour = "grey50") +
+    { if (!is.null(cov_df)) geom_line(data = cov_df, aes(pos, z), colour = "#222222", linewidth = 0.35) } +
+    { if (!is.null(junc_df)) geom_point(data = junc_df, aes(pos, y), colour = "#534AB7", size = 2.6) } +
+    { if (!is.null(aa_df)) geom_segment(data = aa_df, aes(x = start, xend = end, y = y, yend = y),
+                  colour = "#BA7517", linewidth = 4) } +
+    scale_fill_manual(values = c(gain = "#1D9E75", dip = "#D4537E"), name = "Coverage segment") +
+    facet_grid(track ~ ., scales = "free_y", switch = "y") +
+    labs(title = paste("Feature tracks —", sid),
+         subtitle = if (nzchar(state_label)) paste("State:", state_label) else NULL,
+         x = "HPV genome position (bp)", y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(strip.placement = "outside",
+          strip.text.y.left = element_text(angle = 0, face = "bold"),
+          panel.grid.minor = element_blank(), legend.position = "bottom")
+}
+```
+
+```{r choose-and-save}
+# integrated samples that also have coverage, most sites first
+plot_ids <- results %>%
+  filter(has_hv_junctions, !is.na(cov_frac_gain)) %>%
+  arrange(desc(n_sites)) %>%
+  slice_head(n = params$n_plot_samples) %>%
+  transmute(sample_id, state = as.character(state))
+
+saved <- character()
+for (i in seq_len(nrow(plot_ids))) {
+  sid <- plot_ids$sample_id[i]
+  p   <- plot_sample_tracks(sid, state_label = plot_ids$state[i])
+  fn  <- file.path(params$fig_dir, paste0("HPVtracks_", gsub("[^A-Za-z0-9_]+", "_", sid), ".pdf"))
+  ggsave(fn, p, width = 9, height = if (isTRUE(params$use_aa)) 6.5 else 5)
+  saved <- c(saved, normalizePath(fn, mustWork = FALSE))
+}
+cat("Saved per-sample track PDFs:\n"); cat(paste0("  - ", saved), sep = "\n")
+```
+
+```{r show-one, fig.width=9, fig.height=5}
+if (nrow(plot_ids)) plot_sample_tracks(plot_ids$sample_id[1], plot_ids$state[1])
+```
+
+To plot any specific patient/timepoint, call
+`plot_sample_tracks("HN2186_Baseline")`.
+
+------------------------------------------------------------------------
+
+# 8 Session info
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```

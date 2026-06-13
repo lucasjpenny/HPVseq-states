@@ -18,3 +18,7 @@ results/
 
 # Cowork / Claude local settings
 .claude/
+
+# generated plot outputs
+plots/
+HPVtracks_*.pdf
