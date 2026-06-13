@@ -1,5 +1,5 @@
 ---
-title: "HPV State Classification"
+title: "HPV State Classification + Coordinate Concordance"
 subtitle: "Integrating searcHPV, AmpliconArchitect, and per-base coverage z-scores"
 date: "`r Sys.Date()`"
 output:
@@ -24,6 +24,9 @@ params:
   excess_gain_frac:   0.50   # if >= this fraction of bases gained, treat as episomal pool
   distant_flank_mb:   10     # human flanks farther apart than this (same chr) = chimeric signal
   focal_cn:           10     # AA max copy number above this = focal amplification
+  overlap_window_bp:  200    # window (bp) to call a coverage/junction/AA overlap (Section 7)
+  cov_gap_tol:        25     # bp: merge elevated runs separated by gaps <= this into one segment
+  cov_min_seg_len:    30     # bp: discard sustained segments shorter than this (noise)
   out_dir:            "results"
 editor_options:
   markdown:
@@ -507,7 +510,241 @@ results_real %>% count(state, name = "n", .drop = FALSE) %>%
 
 ------------------------------------------------------------------------
 
-# 7 Session info
+# 7 Coordinate concordance (where the three agree)
+
+The classifier above works on per-sample summaries. This section is the
+positional analysis you asked for: it places all three data types on a shared
+coordinate axis and finds regions where a **coverage segment edge**, a
+**searcHPV junction**, and an **AmpliconArchitect boundary** coincide within a
+window (`params$overlap_window_bp`, default `r params$overlap_window_bp` bp).
+
+A coverage breakpoint here is the **edge of a sustained segment**: a run of
+bases continuously elevated (or depressed) that averages beyond |z| >= 1.5 and
+then steps back to normal. Brief sub-threshold flickers inside a run are bridged
+(`cov_gap_tol`) and short noise spikes are dropped (`cov_min_seg_len`), so a
+single integrated viral block yields exactly two breakpoints (its start and
+end), not a scatter of crossings.
+
+**Concordance is expected to be partial.** The three assays will often disagree
+on a given edge, by design: overlapping integration segments merge in coverage,
+AA may not resolve a sub-range, a junction may have no coverage shift. Every
+region is therefore reported with `n_types` (1, 2, or 3) and a `support` label,
+and nothing is dropped for lacking all three. A region with all three is the
+strongest call; two-of-three is still informative.
+
+The axis matters. Coverage z-scores are indexed along the **HPV genome**, and
+searcHPV gives a viral coordinate (`hpvInsertionPoint`) for every junction, so
+the HPV axis is the only place all three data types can be compared directly.
+AA viral intervals (`hpv16ref_1:start-end`) supply the third anchor there. A
+separate **human-axis** check asks whether junction human breakpoints fall
+inside AA human amplicon intervals (coverage cannot participate, since the
+z-profile is viral-only).
+
+Overlap is reported, not required. Each region is tagged with which of the
+three types support it (`n_types` = 1, 2, or 3), so partial agreement is
+visible rather than discarded.
+
+## 7.1 Concordance functions
+
+```{r concord-fns}
+# A coverage "transition" is the EDGE of a sustained segment: a run of bases
+# that is continuously elevated (or depressed) and averages beyond |z| >= z_cut,
+# then steps back to normal. We detect the segments, then the breakpoint anchors
+# are the segment start/end positions.
+#
+# gap_tol lets brief dips below threshold stay inside one segment; min_len drops
+# short noise spikes; the mean-over-segment test enforces "continuously over 1.5
+# on average".
+seg_from_flag <- function(flag, gap_tol) {
+  idx <- which(flag)
+  if (length(idx) == 0) return(list())
+  brk <- c(0L, which(diff(idx) > (gap_tol + 1L)), length(idx))
+  lapply(seq_len(length(brk) - 1L), function(j) {
+    grp <- idx[(brk[j] + 1L):brk[j + 1L]]
+    c(min(grp), max(grp))
+  })
+}
+
+cov_segments <- function(zvec, cut = params$z_cut,
+                         gap_tol = params$cov_gap_tol,
+                         min_len = params$cov_min_seg_len) {
+  out <- list()
+  for (dir in c(1L, -1L)) {
+    flag <- if (dir == 1L) zvec >= cut else zvec <= -cut
+    for (m in seg_from_flag(flag, gap_tol)) {
+      s <- m[1]; e <- m[2]
+      if (e - s + 1L < min_len) next
+      mz <- mean(zvec[s:e])
+      if ((dir == 1L && mz >= cut) || (dir == -1L && mz <= -cut)) {
+        out[[length(out) + 1L]] <- tibble(seg_start = s, seg_end = e,
+                                          type = if (dir == 1L) "gain" else "dip",
+                                          mean_z = mz, len = e - s + 1L)
+      }
+    }
+  }
+  if (length(out) == 0)
+    return(tibble(seg_start = integer(), seg_end = integer(),
+                  type = character(), mean_z = double(), len = integer()))
+  bind_rows(out) %>% arrange(seg_start)
+}
+
+# Breakpoint anchors contributed by coverage = the edges of each sustained segment.
+cov_edges <- function(zvec, ...) {
+  segs <- cov_segments(zvec, ...)
+  if (nrow(segs) == 0) return(integer())
+  sort(unique(c(segs$seg_start, segs$seg_end)))
+}
+
+# searcHPV viral coordinate of each junction for one sample.
+junction_viral_pos <- function(df, sid) {
+  df %>%
+    mutate(sample_id = str_remove(Sample, "__HPV\\d+.*$"),
+           hpv_pos   = suppressWarnings(as.numeric(str_trim(as.character(hpvInsertionPoint))))) %>%
+    filter(sample_id == sid, !is.na(hpv_pos)) %>% pull(hpv_pos)
+}
+
+# AA viral interval boundaries (start and end of every hpv interval) for one sample.
+aa_viral_boundaries <- function(df, sid) {
+  rows <- df %>% filter(`Sample name` == sid)
+  if (nrow(rows) == 0) return(numeric(0))
+  locs <- unlist(str_extract_all(rows$Location, "hpv[^']*?:\\d+-\\d+"))
+  if (length(locs) == 0) return(numeric(0))
+  m <- str_match(locs, ":(\\d+)-(\\d+)")
+  as.numeric(c(m[, 2], m[, 3]))
+}
+
+# Cluster all anchors within W bp and tag which data types support each region.
+build_concordance <- function(sid, zvec, shpv_df, aa_df,
+                              W = params$overlap_window_bp) {
+  anchors <- bind_rows(
+    tibble(source = "coverage", pos = cov_edges(zvec)),
+    tibble(source = "junction", pos = junction_viral_pos(shpv_df, sid)),
+    tibble(source = "AA",       pos = aa_viral_boundaries(aa_df, sid))
+  ) %>% filter(!is.na(pos)) %>% arrange(pos)
+  if (nrow(anchors) == 0) return(tibble())
+
+  grp <- integer(nrow(anchors)); g <- 0L; last <- -Inf
+  for (i in seq_len(nrow(anchors))) {
+    if (anchors$pos[i] - last > W) g <- g + 1L
+    grp[i] <- g; last <- anchors$pos[i]
+  }
+  anchors$region <- grp
+
+  anchors %>%
+    group_by(region) %>%
+    summarise(
+      sample_id = sid,
+      hpv_start = min(pos), hpv_end = max(pos),
+      coverage  = any(source == "coverage"),
+      junction  = any(source == "junction"),
+      AA        = any(source == "AA"),
+      .groups   = "drop"
+    ) %>%
+    mutate(n_types = coverage + junction + AA,
+           support = case_when(n_types == 3 ~ "all three",
+                               n_types == 2 ~ "two of three",
+                               TRUE         ~ "single")) %>%
+    select(sample_id, region, hpv_start, hpv_end,
+           coverage, junction, AA, n_types, support)
+}
+
+# Human-axis supplement: junction human breakpoint inside an AA human interval.
+aa_human_intervals <- function(df, sid) {
+  rows <- df %>% filter(`Sample name` == sid)
+  locs <- unlist(str_extract_all(rows$Location, "chr[^']*?:\\d+-\\d+"))
+  if (length(locs) == 0) return(tibble(chr = character(), start = double(), end = double()))
+  m <- str_match(locs, "(chr[\\dXYM]+):(\\d+)-(\\d+)")
+  tibble(chr = m[, 2], start = as.numeric(m[, 3]), end = as.numeric(m[, 4]))
+}
+
+human_overlap <- function(shpv_df, aa_df, sid) {
+  jh <- shpv_df %>%
+    mutate(sample_id = str_remove(Sample, "__HPV\\d+.*$")) %>%
+    filter(sample_id == sid) %>%
+    transmute(chr = genomeInsertionChromosome,
+              pos = suppressWarnings(as.numeric(str_trim(as.character(genomeInsertionPoint)))))
+  ai <- aa_human_intervals(aa_df, sid)
+  if (nrow(jh) == 0) return(tibble())
+  jh %>%
+    rowwise() %>%
+    mutate(in_aa_interval = any(ai$chr == chr & ai$start <= pos & ai$end >= pos)) %>%
+    ungroup() %>%
+    mutate(sample_id = sid) %>%
+    select(sample_id, chr, pos, in_aa_interval)
+}
+```
+
+## 7.2 Aligned demonstration
+
+Two integration samples on a full-length viral axis (HPV16, ~7906 bp). The
+coverage gain blocks span each integrated viral segment, and the AA viral
+intervals are the matching sub-ranges, so segment edges, junctions, and AA
+boundaries should line up. `S_multi` has two integration sites whose viral
+segments partly overlap: in coverage they merge into one sustained block, so
+coverage contributes only the outer two edges while junctions and AA still mark
+all four. That is exactly the partial-concordance case, the inner edges resolve
+to two-of-three rather than all three.
+
+```{r concord-demo}
+hpv_len <- 7906
+mk_full <- function(blocks, len = hpv_len, sd = 0.3) {
+  z <- rnorm(len, 0, sd)
+  for (b in blocks) z[b[1]:b[2]] <- z[b[1]:b[2]] + b[3]
+  z
+}
+set.seed(2)
+zvecs <- list(
+  S_single = mk_full(list(c(1200, 6500, 4))),
+  S_multi  = mk_full(list(c(900, 5200, 4), c(3100, 7100, 4)))
+)
+
+# AA frame for the demo: viral sub-ranges matching the integrated segments
+# (kept separate from the classifier's synth_aa so Sections 5-6 are untouched).
+aa_demo <- tribble(
+  ~`Sample name`, ~Classification, ~Location,                                          ~`Feature maximum copy number`,
+  "S_single",     "Linear",        "['chr13:34100000-34120000','hpv16ref_1:1200-6500']", 6,
+  "S_multi",      "Linear",        "['chr8:128690000-128710000','hpv16ref_1:900-5200']", 5,
+  "S_multi",      "Linear",        "['chr3:61490000-61510000','hpv16ref_1:3100-7100']",  4
+)
+
+concordance_tbl <- bind_rows(
+  build_concordance("S_single", zvecs$S_single, synth_shpv, aa_demo),
+  build_concordance("S_multi",  zvecs$S_multi,  synth_shpv, aa_demo)
+)
+
+write_tsv(concordance_tbl, file.path(params$out_dir, "hpv_axis_concordance.tsv"))
+
+concordance_tbl %>%
+  kable(caption = "HPV-axis overlap regions (coverage transition / junction / AA boundary)",
+        col.names = c("Sample", "Region", "HPV start", "HPV end",
+                      "Coverage", "Junction", "AA", "N types", "Support")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE) %>%
+  row_spec(which(concordance_tbl$n_types == 3), background = "#e6f4ea")
+```
+
+## 7.3 Human-axis check
+
+```{r concord-human}
+human_tbl <- bind_rows(
+  human_overlap(synth_shpv, aa_demo, "S_single"),
+  human_overlap(synth_shpv, aa_demo, "S_multi")
+)
+
+human_tbl %>%
+  kable(caption = "Junction human breakpoints vs AA human amplicon intervals",
+        col.names = c("Sample", "Chr", "Human pos", "Inside AA interval?")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+A region supported by **all three** on the HPV axis, whose human breakpoint
+also sits inside an AA human interval, is the strongest possible integration
+call from these inputs: the junction, the architecture, and the coverage shift
+all point to the same place.
+
+------------------------------------------------------------------------
+
+# 8 Session info
 
 ```{r session-info, echo=FALSE}
 sessionInfo()
