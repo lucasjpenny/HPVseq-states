@@ -1,6 +1,6 @@
 ---
-title: "HPV State Classification — OPC real data (HN-keyed)"
-subtitle: "searcHPV V2 + per-base coverage z-scores, AmpliconArchitect optional"
+title: "HPV State Classification + Loci, Read Support & Orientation — OPC (HN-keyed)"
+subtitle: "Updated searcHPV (srNum + orientation) + coverage z-scores; junctions sized by reads"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -14,7 +14,7 @@ output:
 params:
   # ── Inputs ────────────────────────────────────────────────────────────────
   summary_xlsx:  "data/summ_OPC.v7.2.xlsx"                 # crosswalk: seqname <-> HN id
-  searchhpv_txt: "data/2024-05-27_SearcHPV_OPC_V2.txt"     # OPC integration (V2 schema)
+  searchhpv_txt: "data/SearcHPV_OPC_srNum_orient.txt"      # updated searcHPV: has srNum + orientation (no id/Timepoint/HPV_realign cols)
   zscore_csv:    "data/20241205_Zscores_stats_nofilter.csv" # OPC per-base coverage z-scores
   aa_tsv:        "data/merged_result_tables.tsv"            # AA (NOT OPC yet) - only used if use_aa
   # ── The toggle you asked for ──────────────────────────────────────────────
@@ -23,7 +23,11 @@ params:
   timepoint_filter:   "Baseline"   # keep only this timepoint; set "" or null for all
   # ── Thresholds (tune here) ────────────────────────────────────────────────
   high_conf_site_only: false  # TRUE = keep only "High Confidence Site" searcHPV breakpoints
+  min_sr:             1       # drop breakpoints with srNum below this (1 = keep all; file is already filtered upstream)
   site_bin_bp:        200     # window (bp) to collapse nearby breakpoints into one site
+  cluster_dist_bp:    100000  # related-integration clustering: same HPV type + chr within this distance = one locus
+  episomal_margin_bp: 200     # bp margin around the junction-spanned arc when looking for episomal coverage
+  episomal_present_frac: 0.5  # fraction of outside-arc bases that must show coverage (z >= -z_cut) to call episomal HPV present
   z_cut:              1.5     # |z| >= this = coverage dip (negative) or gain (positive)
   uniform_frac:       0.05    # if < this fraction of bases deviate, coverage is "uniform"
   excess_gain_frac:   0.50    # if >= this fraction of bases gained, treat as episomal pool
@@ -35,9 +39,8 @@ params:
   cov_gap_tol:        25      # bp: merge elevated runs separated by gaps <= this
   cov_smooth_bp:      75      # bp: rolling-mean window applied before segmenting (kills noise spikes); 1 = off
   cov_min_seg_len:    150     # bp: discard sustained segments shorter than this (noise)
-  n_plot_samples:     6       # how many integrated samples to draw track PDFs for
   out_dir:            "results"   # TSV tables
-  fig_dir:            "plots"     # per-sample plot PDFs go in this sub-directory
+  fig_dir:            "plots"     # per-sample plot PDFs (organised into per-state sub-folders)
 editor_options:
   markdown:
     wrap: 72
@@ -104,18 +107,22 @@ state_levels <- c(
   "HPV episomal rearranged",
   "Human-HPV chimeric episome",
   "Integrated clonal, single site",
+  "Integrated clonal, single site + episomal HPV",
   "Integrated clonal, multiple sites",
+  "Integrated clonal, multiple sites + episomal HPV",
   "Integrated + episomal (mixed)",
   "Unclassified"
 )
 state_palette <- c(
-  "Episomal only"                     = "#1D9E75",
-  "HPV episomal rearranged"           = "#3EC9A7",
-  "Human-HPV chimeric episome"        = "#D4537E",
-  "Integrated clonal, single site"    = "#534AB7",
-  "Integrated clonal, multiple sites" = "#3A2F8F",
-  "Integrated + episomal (mixed)"     = "#BA7517",
-  "Unclassified"                      = "#888780"
+  "Episomal only"                                    = "#1D9E75",
+  "HPV episomal rearranged"                          = "#3EC9A7",
+  "Human-HPV chimeric episome"                       = "#D4537E",
+  "Integrated clonal, single site"                   = "#534AB7",
+  "Integrated clonal, single site + episomal HPV"    = "#8C84E0",
+  "Integrated clonal, multiple sites"                = "#3A2F8F",
+  "Integrated clonal, multiple sites + episomal HPV" = "#6E63C9",
+  "Integrated + episomal (mixed)"                    = "#BA7517",
+  "Unclassified"                                     = "#888780"
 )
 
 cat(sprintf("AmpliconArchitect: %s\n", if (isTRUE(params$use_aa)) "ENABLED" else "DISABLED (searcHPV + coverage only)"))
@@ -168,23 +175,27 @@ head(summ, 5) %>% kable() %>%
 Each parser returns a per-sample feature table keyed by the HN
 `sample_id`.
 
-## 3.1 searcHPV (V2 schema)
+## 3.1 searcHPV (updated schema: srNum + orientation)
 
-The V2 file has no `orientation` or `srNum` columns, so reciprocal-pair
-and read-count filters from earlier versions are dropped. Breakpoints
-are filtered by `SiteConfidence` instead (optional, via
-`high_conf_site_only`), and the HN id is taken from the file's own `id`
-column when present, otherwise resolved through the crosswalk, otherwise
-derived from the sample name (so synthetic tests still work).
+The updated file carries `srNum` (supporting reads) and `orientation`
+(`hv`/`vh`), but no `id`/`Timepoint`/`HPV_realign` columns. The HN id is
+resolved through the crosswalk (handled in the load chunk), HPV type
+comes from the embedded `__HPV##`, breakpoints can be filtered by read
+support (`min_sr`) and/or `SiteConfidence` (`high_conf_site_only`), and
+per sample we also record whether both orientations are present
+(`has_reciprocal`, i.e. both flanks of an integration seen) and the
+read-support summary.
 
 ```{r parse-searchpv}
 parse_searchpv <- function(df,
                            high_conf_site_only = params$high_conf_site_only,
+                           min_sr = params$min_sr,
                            bin_bp = params$site_bin_bp) {
   empty <- tibble(sample_id = character(), hpv_type = character(),
                   n_breakpoints = integer(), n_sites = integer(),
                   n_distinct_chr = integer(), chr_coord_range_mb = double(),
-                  flanks_noncontiguous = logical(), has_hv_junctions = logical())
+                  flanks_noncontiguous = logical(), has_hv_junctions = logical(),
+                  has_reciprocal = logical(), max_sr = integer(), median_sr = double())
   if (is.null(df) || nrow(df) == 0) return(empty)
 
   sid <- if ("id" %in% names(df)) as.character(df$id) else
@@ -194,16 +205,19 @@ parse_searchpv <- function(df,
   hpv <- if ("HPV_realign" %in% names(df)) as.character(df$HPV_realign) else
            str_extract(as.character(df$Sample), "HPV\\d+")
   conf <- if ("SiteConfidence" %in% names(df)) as.character(df$SiteConfidence) else NA_character_
+  ori  <- if ("orientation" %in% names(df)) as.character(df$orientation) else NA_character_
+  sr   <- if ("srNum" %in% names(df)) suppressWarnings(as.numeric(df$srNum)) else NA_real_
 
   work <- tibble(
-    sample_id = sid,
-    hpv_type  = hpv,
-    chr       = as.character(df$genomeInsertionChromosome),
-    pos       = suppressWarnings(as.numeric(str_trim(as.character(df$genomeInsertionPoint)))),
-    site_conf = conf
+    sample_id = sid, hpv_type = hpv,
+    chr = as.character(df$genomeInsertionChromosome),
+    pos = suppressWarnings(as.numeric(str_trim(as.character(df$genomeInsertionPoint)))),
+    site_conf = conf, orientation = ori, sr_num = sr
   )
   if (isTRUE(high_conf_site_only) && any(!is.na(work$site_conf)))
     work <- filter(work, str_detect(tolower(coalesce(site_conf, "")), "high"))
+  if (min_sr > 1 && any(!is.na(work$sr_num)))
+    work <- filter(work, is.na(sr_num) | sr_num >= min_sr)
   if (nrow(work) == 0) return(empty)
 
   work %>%
@@ -217,13 +231,19 @@ parse_searchpv <- function(df,
       chr_coord_range_mb = if (n_distinct(chr) == 1)
                              (max(pos, na.rm = TRUE) - min(pos, na.rm = TRUE)) / 1e6
                            else NA_real_,
+      has_reciprocal     = any(orientation == "hv", na.rm = TRUE) &
+                           any(orientation == "vh", na.rm = TRUE),
+      max_sr             = suppressWarnings(max(sr_num, na.rm = TRUE)),
+      median_sr          = suppressWarnings(median(sr_num, na.rm = TRUE)),
       .groups = "drop"
     ) %>%
     mutate(
       flanks_noncontiguous = (n_distinct_chr > 1) |
                              (!is.na(chr_coord_range_mb) &
                                 chr_coord_range_mb > params$distant_flank_mb),
-      has_hv_junctions = n_breakpoints > 0
+      has_hv_junctions = n_breakpoints > 0,
+      max_sr    = ifelse(is.finite(max_sr), as.integer(max_sr), NA_integer_),
+      median_sr = ifelse(is.finite(median_sr), median_sr, NA_real_)
     )
 }
 ```
@@ -312,8 +332,17 @@ parse_aa <- function(df, focal_cn = params$focal_cn) {
 # 4 Load real data
 
 ```{r load}
-# searcHPV (apply the same timepoint filter when the column is present)
 shpv_raw <- read_tsv(params$searchhpv_txt, show_col_types = FALSE)
+# This file's Sample is "<seqname>__HPV##" with no id/Timepoint columns. Resolve
+# the HN id through the crosswalk (seq2id is already timepoint-filtered), which
+# also applies the timepoint filter: rows that don't map are other timepoints
+# (or not in the cohort) and are dropped.
+if (!("id" %in% names(shpv_raw))) {
+  shpv_raw <- shpv_raw %>%
+    mutate(.base = str_remove(as.character(Sample), "__HPV\\d+.*$"),
+           id    = unname(seq2id[.base])) %>%
+    filter(!is.na(id)) %>% select(-.base)
+}
 if (!is.null(tp_filter) && nzchar(tp_filter) && "Timepoint" %in% names(shpv_raw))
   shpv_raw <- filter(shpv_raw, as.character(Timepoint) == tp_filter)
 shpv_features <- parse_searchpv(shpv_raw)
@@ -436,14 +465,53 @@ cov_vec <- function(sid) {
   if (is.finite(last)) v[seq_len(last)] else v
 }
 
-# searcHPV viral breakpoint positions for one HN id.
+# searcHPV breakpoints for one HN id: viral coordinate (hpv_pos) plus the human
+# locus (chr, human_pos) and HPV type, used for the integration-locus clustering.
 shpv_real <- shpv_raw %>%
   mutate(sample_id = if ("id" %in% names(.)) as.character(id) else
                        ifelse(as.character(Sample) %in% names(seq2id),
                               unname(seq2id[as.character(Sample)]),
                               str_remove(as.character(Sample), "__HPV\\d+.*$")),
-         hpv_pos   = suppressWarnings(as.numeric(str_trim(as.character(hpvInsertionPoint)))))
+         hpv_pos   = suppressWarnings(as.numeric(str_trim(as.character(hpvInsertionPoint)))),
+         chr       = as.character(genomeInsertionChromosome),
+         human_pos = suppressWarnings(as.numeric(str_trim(as.character(genomeInsertionPoint)))),
+         hpv_type  = if ("HPV_realign" %in% names(.)) as.character(HPV_realign)
+                     else str_extract(as.character(Sample), "HPV\\d+"))
 junc_pos <- function(sid) shpv_real %>% filter(sample_id == sid, !is.na(hpv_pos)) %>% pull(hpv_pos)
+
+# ── Related-integration clustering (human locus) ──────────────────────────────
+# Within a sample, group breakpoints of the SAME HPV type on the SAME chromosome
+# whose human positions are within cluster_dist_bp (single-linkage). Each group is
+# one integration locus; two breakpoints in the same group are "related", separate
+# groups are independent loci. Cross-chromosome = always separate.
+breakpoint_clusters <- function(sid, dist = params$cluster_dist_bp) {
+  d <- shpv_real %>% filter(sample_id == sid, !is.na(human_pos), !is.na(chr))
+  if (nrow(d) == 0) return(tibble())
+  d %>%
+    arrange(hpv_type, chr, human_pos) %>%
+    group_by(hpv_type, chr) %>%
+    mutate(local_cl = cumsum(c(TRUE, diff(human_pos) > dist))) %>%
+    group_by(hpv_type, chr, local_cl) %>%
+    mutate(cluster_id = sprintf("%s:%.2fMb", chr[1], min(human_pos) / 1e6)) %>%
+    ungroup()
+}
+
+# One row per integration locus for a sample.
+integration_clusters <- function(sid, dist = params$cluster_dist_bp) {
+  bp <- breakpoint_clusters(sid, dist)
+  if (nrow(bp) == 0) return(tibble())
+  bp %>%
+    group_by(hpv_type, chr, cluster_id) %>%
+    summarise(n_breakpoints = n(),
+              human_start = min(human_pos), human_end = max(human_pos),
+              span_bp     = human_end - human_start,
+              viral_pos   = paste(sort(unique(round(hpv_pos))), collapse = ","),
+              .groups = "drop") %>%
+    mutate(sample_id = sid, related = n_breakpoints >= 2) %>%
+    arrange(chr, human_start) %>%
+    select(sample_id, cluster_id, hpv_type, chr, human_start, human_end,
+           span_bp, n_breakpoints, related, viral_pos)
+}
 
 # AA viral intervals for one HN id (empty when AA off).
 aa_intervals <- function(sid) {
@@ -490,16 +558,44 @@ concordance_for <- function(sid, W = params$junc_cov_window_bp) {
   tibble(n_junc = length(jpos), n_junc_on_cov = n_on, frac_junc_on_cov = frac,
          n_cov_block = n_seg, n_cov_block_unexplained = n_unexpl, concordance = lab)
 }
+
+# ── Episomal co-presence (coverage beyond the integrated arc) ─────────────────
+# Logic (your call): the integrated viral segment is the span between the
+# outermost junctions (the "arc"). HPV coverage OUTSIDE that arc that is not
+# dropped out (z >= -z_cut) implies free/episomal HPV in addition to the
+# integrated copy. Needs >= 2 junctions to define an arc, and enough genome
+# outside the arc to assess. Returns the fraction covered outside and a flag.
+#
+# CAVEAT: these are cohort-relative z-scores that rarely go deep-negative, so
+# outside-arc coverage reads as "present" for most baseline samples. Treat the
+# flag as "HPV present beyond the integration", tune episomal_present_frac, and
+# read frac_outside_covered as the real quantity.
+episomal_for <- function(sid, margin = params$episomal_margin_bp) {
+  jp <- junc_pos(sid); z <- cov_vec(sid)
+  na <- tibble(frac_outside_covered = NA_real_, n_outside = 0L, episomal_present = NA)
+  if (length(jp) < 2 || length(z) == 0) return(na)
+  zs  <- roll_mean(z, params$cov_smooth_bp)
+  a <- min(jp); b <- max(jp); pos <- seq_along(zs)
+  outside <- pos < (a - margin) | pos > (b + margin)
+  zo <- zs[outside]; zo <- zo[!is.na(zo)]
+  if (length(zo) < 200) return(na)          # arc spans (almost) the whole genome
+  frac <- mean(zo >= -params$z_cut)
+  tibble(frac_outside_covered = frac, n_outside = length(zo),
+         episomal_present = frac >= params$episomal_present_frac)
+}
 ```
 
 ------------------------------------------------------------------------
 
 # 5 Classifier
 
-Site count (single vs multiple) is decided by the searcHPV junction
-count. Coverage that exceeds the junction count (extra gains or losses)
-is recorded in `notes`, not used to change the site count. AA-dependent
-states are only reachable when `use_aa` is on.
+Site count (single vs multiple) is decided by the number of integration
+**loci** (`n_loci`), the human-genome clusters from Section 4.1. Two
+flanking junctions of one integration sit at one locus and count as a
+single site, fixing the earlier over-count where the 200 bp bins split
+them into two. Coverage that exceeds the locus count is recorded in
+`notes`, not used to change the count. AA-dependent states are only
+reachable when `use_aa` is on.
 
 ```{r classify-fn}
 classify_state <- function(r) {
@@ -509,7 +605,9 @@ classify_state <- function(r) {
   noncontig_flank <- isTRUE(r$flanks_noncontiguous)
   uniform         <- isTRUE(r$cov_uniform)
   excess          <- isTRUE(r$cov_excess)
-  n_sites         <- ifelse(is.na(r$n_sites), 0L, r$n_sites)
+  # site count comes from integration LOCI (clustered), not raw 200 bp bins, so
+  # the two flanking junctions of one integration count as a single site.
+  n_loci          <- ifelse(is.na(r$n_loci), 0L, r$n_loci)
   has_cov         <- !is.na(r$cov_frac_gain)
 
   if (!hv) {
@@ -520,8 +618,8 @@ classify_state <- function(r) {
   if (cyclic_human || (noncontig_flank && cyclic_hpv))
     return("Human-HPV chimeric episome")
   if (cyclic_hpv || excess) return("Integrated + episomal (mixed)")
-  if (n_sites >= 2) return("Integrated clonal, multiple sites")
-  if (n_sites == 1) return("Integrated clonal, single site")
+  if (n_loci >= 2) return("Integrated clonal, multiple sites")
+  if (n_loci == 1) return("Integrated clonal, single site")
   "Unclassified"
 }
 
@@ -529,15 +627,15 @@ add_notes <- function(df, aa_enabled = isTRUE(params$use_aa)) {
   df %>%
     mutate(
       cov_extra = coalesce(has_hv_junctions, FALSE) &
-                  coalesce(cov_n_event_seg, 0L) > coalesce(n_sites, 0L),
+                  coalesce(cov_n_event_seg, 0L) > coalesce(n_loci, 0L),
       no_aa = aa_enabled & is.na(aa_has_hpv),
       notes = pmap_chr(
-        list(cov_extra, no_aa, cov_n_event_seg, n_sites),
+        list(cov_extra, no_aa, cov_n_event_seg, n_loci),
         function(extra, na_aa, nev, ns) {
           msgs <- character()
           if (isTRUE(extra))
             msgs <- c(msgs, sprintf(
-              "coverage shows %d event segment(s) vs %d junction site(s); extra is coverage-only and NOT counted as a site",
+              "coverage shows %d event segment(s) vs %d integration locus/loci; extra is coverage-only and NOT counted as a site",
               ifelse(is.na(nev), 0L, nev), ifelse(is.na(ns), 0L, ns)))
           if (isTRUE(na_aa))
             msgs <- c(msgs, "no AmpliconArchitect evidence for this sample")
@@ -550,8 +648,12 @@ classify_table <- function(unified, aa_enabled = isTRUE(params$use_aa)) {
   if (nrow(unified) == 0)
     return(mutate(unified, state = factor(character(), levels = state_levels)))
   states <- pmap_chr(unified, function(...) classify_state(tibble(...)))
+  ep <- if ("episomal_present" %in% names(unified)) unified$episomal_present else NA
   unified %>%
-    mutate(state = factor(states, levels = state_levels)) %>%
+    mutate(state_base = states,
+           state = if_else(str_starts(state_base, "Integrated clonal") & coalesce(ep, FALSE),
+                           paste0(state_base, " + episomal HPV"), state_base),
+           state = factor(state, levels = state_levels)) %>%
     add_notes(aa_enabled = aa_enabled)
 }
 ```
@@ -561,11 +663,34 @@ classify_table <- function(unified, aa_enabled = isTRUE(params$use_aa)) {
 # 6 Classify the OPC cohort
 
 ```{r classify-run}
+# Related-integration locus clustering FIRST, so the single-vs-multiple decision
+# uses loci (one integration locus = one site, even with two flanking junctions),
+# not the 200 bp human bins (which split flanking junctions of one event).
+conc_ids     <- unified %>% filter(has_hv_junctions) %>% pull(sample_id)
+clusters_all <- bind_rows(lapply(conc_ids, integration_clusters))
+loci_summary <- if (nrow(clusters_all)) clusters_all %>%
+  group_by(sample_id) %>%
+  summarise(n_loci = n_distinct(cluster_id),
+            n_related_loci = sum(related),
+            max_bp_in_locus = max(n_breakpoints), .groups = "drop") else
+  tibble(sample_id = character(), n_loci = integer(),
+         n_related_loci = integer(), max_bp_in_locus = integer())
+unified <- unified %>% left_join(loci_summary, by = "sample_id") %>%
+  mutate(n_loci = coalesce(n_loci, 0L), n_related_loci = coalesce(n_related_loci, 0L))
+
+# Episomal co-presence (coverage beyond the integrated arc).
+episo_df <- bind_rows(lapply(conc_ids, function(s) mutate(episomal_for(s), sample_id = s)))
+if (!nrow(episo_df))
+  episo_df <- tibble(sample_id = character(), frac_outside_covered = double(),
+                     n_outside = integer(), episomal_present = logical())
+unified <- unified %>% left_join(episo_df, by = "sample_id")
+if (!"episomal_present" %in% names(unified))
+  unified <- mutate(unified, episomal_present = NA, frac_outside_covered = NA_real_, n_outside = 0L)
+
 results <- classify_table(unified)
 
 # Junction-vs-coverage concordance (does NOT change state; flags only).
-conc_ids <- results %>% filter(has_hv_junctions) %>% pull(sample_id)
-conc_df  <- bind_rows(lapply(conc_ids, function(s) mutate(concordance_for(s), sample_id = s)))
+conc_df <- bind_rows(lapply(conc_ids, function(s) mutate(concordance_for(s), sample_id = s)))
 if (nrow(conc_df)) results <- left_join(results, conc_df, by = "sample_id")
 
 state_summary <- results %>% count(state, name = "n", .drop = FALSE) %>% arrange(desc(n))
@@ -590,7 +715,9 @@ results %>%
 out_tbl <- results %>%
   transmute(
     sample_id, patient, timepoint, state, hpv_type,
-    junctions = has_hv_junctions, n_sites,
+    junctions = has_hv_junctions, n_sites, n_loci, n_related_loci,
+    has_reciprocal, max_sr, median_sr,
+    episomal_present, frac_outside_covered,
     cov_frac_gain, cov_frac_dip, cov_uniform, cov_excess, cov_n_event_seg,
     concordance, frac_junc_on_cov, n_cov_block, n_cov_block_unexplained,
     aa_hpv_cyclic, aa_cyclic_has_human, notes
@@ -641,6 +768,73 @@ discordant %>% head(30) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
 ```
 
+## 6.2 Related-integration loci
+
+Each integrated sample's breakpoints are grouped into human-genome loci:
+same HPV type, same chromosome, within `cluster_dist_bp`
+(`r format(params$cluster_dist_bp, big.mark = ",")` bp). Breakpoints in
+one locus are **related** (the same integration event/region); separate
+loci are independent integrations. `n_loci` is how many distinct loci a
+sample carries; `related = TRUE` marks a locus holding two or more
+breakpoints.
+
+```{r clusters-out}
+write_tsv(clusters_all, file.path(params$out_dir, "hpv_integration_clusters_OPC.tsv"))
+
+# How many loci do integrated samples carry?
+results %>%
+  filter(has_hv_junctions) %>%
+  count(n_loci, name = "samples") %>%
+  arrange(n_loci) %>%
+  kable(caption = "Integration loci per sample (1 = single locus; >1 = multiple independent loci)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+Loci that contain two or more related breakpoints (your "pairs or more
+at one locus"), most-clustered first:
+
+```{r related-loci}
+clusters_all %>%
+  filter(related) %>%
+  arrange(desc(n_breakpoints), sample_id) %>%
+  transmute(sample_id, locus = cluster_id, hpv_type, chr,
+            n_breakpoints, span_bp, viral_pos) %>%
+  head(30) %>%
+  kable(caption = "Related-integration loci (>= 2 breakpoints within the distance threshold)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
+```
+
+## 6.3 Episomal co-presence (coverage beyond the integrated arc)
+
+For integrated samples with \>= 2 junctions, `frac_outside_covered` is
+the fraction of the HPV genome **outside** the junction-spanned arc that
+still shows coverage (z \>= -`r params$z_cut`). At or above
+`episomal_present_frac` (`r params$episomal_present_frac`) the sample is
+flagged `episomal_present` and its state gets the `+ episomal HPV`
+suffix.
+
+Read `frac_outside_covered` as the real signal: because these z-scores
+rarely go deep-negative, most baseline samples score high here, so the
+binary flag is near-universal. Tune `episomal_present_frac` against this
+distribution.
+
+```{r episomal-summary}
+results %>%
+  filter(has_hv_junctions, !is.na(frac_outside_covered)) %>%
+  mutate(bin = cut(frac_outside_covered, breaks = seq(0, 1, 0.1),
+                   include.lowest = TRUE)) %>%
+  count(bin, name = "samples") %>%
+  kable(caption = "Distribution of frac_outside_covered (integrated samples, >=2 junctions)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+results %>%
+  filter(has_hv_junctions) %>%
+  count(episomal_present, name = "samples") %>%
+  kable(caption = sprintf("episomal_present at threshold %.2f (NA = <2 junctions or arc spans genome)",
+                          params$episomal_present_frac)) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
 Per-patient view across timepoints (HN as the grouping key):
 
 ```{r per-patient}
@@ -660,12 +854,20 @@ results %>%
 
 One figure per sample, stacking coverage z-score, searcHPV junctions,
 and (when `use_aa`) AA viral intervals on the shared HPV-genome axis.
-**Green dotted** verticals are coverage block boundaries (what the
-concordance check compares against); **purple dashed** verticals are
-searcHPV junctions. When they don't line up, the call is discordant
-(HN2408-type). Discordant samples are drawn first. Each is written as a
-PDF named `HPVtracks_<HN id>.pdf` to `params$fig_dir`. The positional
-helpers used here are defined in Section 4.1.
+**Green dotted** verticals are coverage block boundaries; the **junction
+points and dashed verticals are coloured by human integration locus**,
+so breakpoints sharing a colour are related (same chr, within
+`cluster_dist_bp`) and different colours are independent loci. **Dot
+size is proportional to supporting reads (`srNum`, log scale)** and
+**dot shape encodes orientation** (circle = hv, triangle = vh, the two
+flank directions). The **grey band** is the integrated arc (span between
+the outermost junctions); coverage outside it drives the episomal call.
+The caption lists each locus (`chr:pos`, breakpoint count) and the
+outside-arc covered fraction. **Every** sample with junctions and/or
+coverage is plotted, and each PDF is filed into a per-state sub-folder
+of `params$fig_dir` (e.g.
+`plots/Integrated_clonal_single_site_episomal_HPV/HPVtracks_<HN id>.pdf`).
+Helpers are in Section 4.1.
 
 ```{r plot-fn}
 plot_sample_tracks <- function(sid, state_label = "", show_aa = isTRUE(params$use_aa),
@@ -685,56 +887,116 @@ plot_sample_tracks <- function(sid, state_label = "", show_aa = isTRUE(params$us
   thr_df <- tibble(track = as_trk(trk[1]), yint = c(z_cut, -z_cut))
   blk    <- if (length(zvec)) cov_blocks(zvec) else tibble()
   blk_edges <- if (nrow(blk)) sort(unique(c(blk$seg_start, blk$seg_end))) else numeric(0)
-  junc_df <- if (length(jpos)) tibble(pos = jpos, y = 1, track = as_trk(trk[2])) else NULL
+
+  # junctions: coloured by human locus, SIZED by supporting reads (srNum),
+  # SHAPED by orientation (hv vs vh = the two flank directions).
+  bp      <- breakpoint_clusters(sid)
+  has_sr  <- "srNum" %in% names(bp)
+  has_ori <- "orientation" %in% names(bp)
+  junc_df <- if (nrow(bp)) bp %>%
+    transmute(pos = hpv_pos, locus = cluster_id, y = 1, track = as_trk(trk[2]),
+              sr_num = if (has_sr) suppressWarnings(as.numeric(srNum)) else NA_real_,
+              orientation = if (has_ori) as.character(orientation) else NA_character_) %>%
+    filter(!is.na(pos)) else NULL
+  jl_df   <- if (nrow(bp)) bp %>% transmute(pos = hpv_pos, locus = cluster_id) %>%
+                                            filter(!is.na(pos)) else NULL
   aa_df   <- if (show_aa && nrow(ai)) mutate(ai, y = 1, track = as_trk("AA viral intervals")) else NULL
 
+  # integrated arc (span between outermost junctions) + episomal metric
+  ep <- episomal_for(sid)
+  arc_df <- if (length(jpos) >= 2)
+    tibble(xmin = min(jpos), xmax = max(jpos), track = as_trk(trk[1])) else NULL
+
+  # caption: list the integration loci (related breakpoints grouped) + episomal
+  cl <- integration_clusters(sid)
+  loci_cap <- if (nrow(cl)) {
+    lab <- sprintf("%s %s (n=%d)", cl$hpv_type, cl$cluster_id, cl$n_breakpoints)
+    if (length(lab) > 6) lab <- c(lab[1:6], sprintf("+%d more", length(lab) - 6))
+    paste("Integration loci:", paste(lab, collapse = "  |  "))
+  } else "Integration loci: none"
+  if (!is.na(ep$frac_outside_covered))
+    loci_cap <- paste0(loci_cap,
+      sprintf("   |   outside-arc covered: %.0f%%%s", 100 * ep$frac_outside_covered,
+              if (isTRUE(ep$episomal_present)) " (episomal HPV)" else ""))
+  loci_cap <- paste(strwrap(loci_cap, width = 120), collapse = "\n")  # wrap so it isn't clipped
+
+  # GLOBAL read-support size scale (same across every sample so dots are comparable)
+  sr_all  <- if ("srNum" %in% names(shpv_real)) suppressWarnings(as.numeric(shpv_real$srNum)) else numeric(0)
+  sr_all  <- sr_all[is.finite(sr_all) & sr_all > 0]
+  sr_lims <- if (length(sr_all)) range(sr_all) else c(1, 10)
+  sr_brk  <- c(2, 10, 50, 200, 1000, 5000)
+  sr_brk  <- sr_brk[sr_brk >= sr_lims[1] & sr_brk <= sr_lims[2]]
+
   ggplot() +
+    { if (!is.null(arc_df))    # integrated arc shaded grey in the coverage panel
+        geom_rect(data = arc_df, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+                  fill = "grey85", alpha = 0.5, inherit.aes = FALSE) } +
     { if (!is.null(seg_df))
         geom_rect(data = seg_df, aes(xmin = seg_start, xmax = seg_end,
                   ymin = -Inf, ymax = Inf, fill = type), alpha = 0.18, inherit.aes = FALSE) } +
     { if (length(blk_edges))   # coverage block boundaries (green dotted)
         geom_vline(xintercept = blk_edges, linetype = "dotted", colour = "#1D9E75", linewidth = 0.5) } +
-    { if (length(jpos))        # searcHPV junctions (purple dashed)
-        geom_vline(xintercept = jpos, linetype = "dashed", colour = "#534AB7", linewidth = 0.4) } +
+    { if (!is.null(jl_df))     # searcHPV junctions, coloured by human locus
+        geom_vline(data = jl_df, aes(xintercept = pos, colour = locus),
+                   linetype = "dashed", linewidth = 0.4) } +
     geom_hline(data = thr_df, aes(yintercept = yint), linetype = "dotted", colour = "grey50") +
     { if (!is.null(cov_df)) geom_line(data = cov_df, aes(pos, z), colour = "#222222", linewidth = 0.35) } +
-    { if (!is.null(junc_df)) geom_point(data = junc_df, aes(pos, y), colour = "#534AB7", size = 2.6) } +
+    { if (!is.null(junc_df)) geom_point(data = junc_df,
+        aes(pos, y, colour = locus, size = sr_num, shape = orientation)) } +
     { if (!is.null(aa_df)) geom_segment(data = aa_df, aes(x = start, xend = end, y = y, yend = y),
                   colour = "#BA7517", linewidth = 4) } +
     scale_fill_manual(values = c(gain = "#1D9E75", dip = "#D4537E"), name = "Coverage segment") +
+    scale_colour_discrete(name = "Integration locus") +
+    scale_size_continuous(trans = "log10", range = c(1.5, 9), limits = sr_lims,
+                          breaks = sr_brk, name = "reads (srNum)") +
+    scale_shape_manual(values = c(hv = 16, vh = 17), na.value = 15, name = "orientation",
+                       limits = c("hv", "vh"), drop = FALSE) +
     facet_grid(track ~ ., scales = "free_y", switch = "y") +
     labs(title = paste("Feature tracks —", sid),
          subtitle = if (nzchar(state_label)) paste("State:", state_label) else NULL,
+         caption = loci_cap,
          x = "HPV genome position (bp)", y = NULL) +
     theme_minimal(base_size = 12) +
     theme(strip.placement = "outside",
           strip.text.y.left = element_text(angle = 0, face = "bold"),
-          panel.grid.minor = element_blank(), legend.position = "bottom")
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom", legend.box = "vertical",
+          plot.caption = element_text(hjust = 0, size = 8),
+          plot.caption.position = "plot",
+          plot.margin = margin(6, 12, 8, 12)) +
+    guides(size = guide_legend(order = 3), shape = guide_legend(order = 2),
+           colour = guide_legend(order = 1))
 }
 ```
 
 ```{r choose-and-save}
-# integrated samples that also have coverage; discordant ones first so the PDFs
-# you review are the suspect calls, then most-sites among the rest.
+# Plot EVERY sample that has something to show (junctions and/or coverage), and
+# file each PDF into a per-state sub-folder of params$fig_dir.
 plot_ids <- results %>%
-  filter(has_hv_junctions, !is.na(cov_frac_gain)) %>%
-  mutate(is_discordant = concordance %in% c("junctions off coverage", "partial")) %>%
-  arrange(desc(is_discordant), frac_junc_on_cov, desc(n_sites)) %>%
-  slice_head(n = params$n_plot_samples) %>%
-  transmute(sample_id, state = as.character(state))
+  filter(has_hv_junctions | !is.na(cov_frac_gain)) %>%
+  transmute(sample_id, state = as.character(state)) %>%
+  arrange(state, sample_id)
+
+safe <- function(x) gsub("(^_|_$)", "", gsub("[^A-Za-z0-9]+", "_", x))
 
 saved <- character()
 for (i in seq_len(nrow(plot_ids))) {
-  sid <- plot_ids$sample_id[i]
-  p   <- plot_sample_tracks(sid, state_label = plot_ids$state[i])
-  fn  <- file.path(params$fig_dir, paste0("HPVtracks_", gsub("[^A-Za-z0-9_]+", "_", sid), ".pdf"))
-  ggsave(fn, p, width = 9, height = if (isTRUE(params$use_aa)) 6.5 else 5)
-  saved <- c(saved, normalizePath(fn, mustWork = FALSE))
+  sid <- plot_ids$sample_id[i]; st <- plot_ids$state[i]
+  subdir <- file.path(params$fig_dir, safe(st))
+  dir.create(subdir, showWarnings = FALSE, recursive = TRUE)
+  p  <- plot_sample_tracks(sid, state_label = st)
+  fn <- file.path(subdir, paste0("HPVtracks_", safe(sid), ".pdf"))
+  ggsave(fn, p, width = 9, height = if (isTRUE(params$use_aa)) 8 else 7)
+  saved <- c(saved, fn)
 }
-cat("Saved per-sample track PDFs:\n"); cat(paste0("  - ", saved), sep = "\n")
+
+cat(sprintf("Saved %d track PDFs into %s/<state>/:\n", length(saved), params$fig_dir))
+plot_ids %>% count(state, name = "plots") %>% arrange(desc(plots)) %>%
+  kable(caption = "Plots written per state sub-folder") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 ```
 
-```{r show-one, fig.width=9, fig.height=5}
+```{r show-one, fig.width=9, fig.height=7}
 if (nrow(plot_ids)) plot_sample_tracks(plot_ids$sample_id[1], plot_ids$state[1])
 ```
 
